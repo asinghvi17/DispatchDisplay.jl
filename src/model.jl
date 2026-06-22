@@ -70,6 +70,30 @@ numeric_types() = Any[
 ]
 
 """
+A curated palette of common concrete matrix types from `Base`, `LinearAlgebra`,
+and `SparseArrays` — handy for visualising linear-algebra operators, e.g.
+`dispatchdisplay(*, matrix_types(), matrix_types())`. All entries are
+`Float64`-valued so they share an element type and dispatch differences come
+from matrix *structure* alone.
+"""
+matrix_types() = Any[
+    Matrix{Float64},
+    Diagonal{Float64, Vector{Float64}},
+    Bidiagonal{Float64, Vector{Float64}},
+    Tridiagonal{Float64, Vector{Float64}},
+    SymTridiagonal{Float64, Vector{Float64}},
+    UpperTriangular{Float64, Matrix{Float64}},
+    LowerTriangular{Float64, Matrix{Float64}},
+    UnitUpperTriangular{Float64, Matrix{Float64}},
+    UnitLowerTriangular{Float64, Matrix{Float64}},
+    Symmetric{Float64, Matrix{Float64}},
+    Hermitian{Float64, Matrix{Float64}},
+    Transpose{Float64, Matrix{Float64}},
+    Adjoint{Float64, Matrix{Float64}},
+    SparseMatrixCSC{Float64, Int},
+]
+
+"""
 Axes only ever hold **concrete** types. When `provided`, those are used as given
 (`order`ed by the type tree); otherwise the concrete types appearing in `f`'s
 signatures are used — abstract types never become cells, they only show up as

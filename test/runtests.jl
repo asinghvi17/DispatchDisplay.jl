@@ -110,6 +110,7 @@ end
 
 @testset "arity mode, concrete axes, numeric palette, LOD" begin
     @test all(T -> T isa Type && isconcretetype(T), numeric_types())
+    @test all(T -> T isa Type && isconcretetype(T), matrix_types())
 
     # Inferred arity mode: axes hold only concrete types; abstract sig types
     # (here Number) become a bracket, never a cell.

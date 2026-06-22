@@ -121,11 +121,12 @@ end
 
 function draw_brackets_y!(ax, brs, x0, step)
     for b in brs
-        # Draw top→bottom so the bracket opens left (away from the grid),
-        # mirroring the top brackets.
+        # `:up` with a bottom→top span makes the brace embrace the grid from the
+        # left (opening toward the tiles, label on the outside), mirroring the
+        # top brackets which embrace from above.
         x = x0 - b.depth * step
-        Makie.bracket!(ax, x, b.hi + 0.45, x, b.lo - 0.45;
-            offset = 1, text = b.label, orientation = :up, rotation = -pi / 2,
+        Makie.bracket!(ax, x, b.lo - 0.45, x, b.hi + 0.45;
+            offset = 1, text = b.label, orientation = :up, rotation = pi / 2,
             fontsize = 11, textcolor = :gray25, color = :gray45)
     end
 end
@@ -210,8 +211,12 @@ function plot_2d!(pos, model, hovered, info, infocolor, v2r)
     # Big grids (e.g. a whole operator) become a zoomable "dispatch map": no
     # brackets/borders, and labels appear only as you zoom in (level-of-detail).
     big = nx * ny > 600
-    my = (big || isempty(bx)) ? 0.0 : bracket_depth(bx) * step + 0.3   # top room
-    mx = (big || isempty(by)) ? 0.0 : bracket_depth(by) * step + 0.3   # left room
+    # The extra room (beyond the bracket stack) holds the outermost bracket's
+    # label; scale it a little with the grid size so the label isn't clipped on
+    # denser grids (where a data unit maps to fewer pixels).
+    pad = 0.45 + 0.04 * max(nx, ny)
+    my = (big || isempty(bx)) ? 0.0 : bracket_depth(bx) * step + pad   # top room
+    mx = (big || isempty(by)) ? 0.0 : bracket_depth(by) * step + pad   # left room
     # Square cells (DataAspect); the frame is hidden so the letterbox whitespace
     # doesn't read as a gap, and the brackets sit in slim top/left margins.
     ax = Makie.Axis(pos;
@@ -253,14 +258,16 @@ function plot_3d!(pos, model, hovered, info, infocolor, v2r)
     namesZ = typelabel.(model.axes[3])
     pitch = 1.9          # centre-to-centre spacing of the arg₁ slices
     thick = 0.7          # arg₁ thickness of each slice (< pitch ⇒ a visible gap)
+    cellalpha = 0.85     # slightly translucent so neighbours behind show through
 
     pts = Makie.Point3f[]; cols = Makie.RGBAf[]
     cellinfo = Tuple{Int,NTuple{3,Any}}[]
     for i in 1:nx, j in 1:ny, k in 1:nz
         v = model.grid[i, j, k]
         v == 0 && continue                       # gap for uncovered cells
+        c = color_for(model, v)
         push!(pts, Makie.Point3f(i * pitch, j, k))
-        push!(cols, color_for(model, v))
+        push!(cols, Makie.RGBAf(c.r, c.g, c.b, c.alpha * cellalpha))
         push!(cellinfo, (v, (model.axes[1][i], model.axes[2][j], model.axes[3][k])))
     end
 
@@ -272,7 +279,8 @@ function plot_3d!(pos, model, hovered, info, infocolor, v2r)
     if !isempty(pts)
         mp = Makie.meshscatter!(ax, pts;
             marker = Makie.Rect3f(Makie.Vec3f(-0.5), Makie.Vec3f(1)),
-            markersize = Makie.Vec3f(thick, 1.0, 1.0), color = cols)
+            markersize = Makie.Vec3f(thick, 1.0, 1.0), color = cols,
+            transparency = true)
         Makie.on(Makie.events(ax.scene).mouseposition) do _
             if Makie.is_mouseinside(ax.scene)
                 plt, idx = Makie.pick(ax.scene)

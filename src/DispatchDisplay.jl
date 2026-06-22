@@ -18,8 +18,10 @@ module DispatchDisplay
 using Makie
 using Colors
 using CodeTracking
+using LinearAlgebra
+using SparseArrays
 
-export dispatchdisplay, refresh!, numeric_types
+export dispatchdisplay, refresh!, numeric_types, matrix_types
 
 include("introspection.jl")
 include("layout.jl")
