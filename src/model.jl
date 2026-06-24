@@ -94,12 +94,15 @@ matrix_types() = Any[
 ]
 
 """
-Axes only ever hold **concrete** types. When `provided`, those are used as given
-(`order`ed by the type tree); otherwise the concrete types appearing in `f`'s
-signatures are used — abstract types never become cells, they only show up as
-method colours and subtype brackets.
+When `provided`, the supplied types are used as given (ordered by the type
+tree, abstracts allowed). When inferring, axes include every concrete type
+appearing in `f`'s signatures and — when `show_abstracts` — also the abstract
+types that own at least one method; `Any` is included only when `show_any`.
+`Type{<:X}` wrappers are always skipped to avoid noisy axis-spanning entries.
 """
-function build_axes(f, provided, ndims::Int)
+function build_axes(f, provided, ndims::Int;
+                    show_abstracts::Bool = true, show_any::Bool = true,
+                    show_unions::Bool = true)
     axes = Vector{Vector{Any}}(undef, ndims)
     if provided !== nothing
         for i in 1:ndims
@@ -107,13 +110,22 @@ function build_axes(f, provided, ndims::Int)
         end
         return axes
     end
-    inferred = infer_axes(f, ndims)
+    inferred = infer_axes(f, ndims; include_unions = show_unions)
     for i in 1:ndims
-        concretes = [T for T in unique(inferred[i]) if T isa Type && isconcretetype(T)]
-        isempty(concretes) && error(
-            "No concrete argument types found at position $i among `$f`'s " *
-            "$ndims-argument methods; pass explicit concrete `types`.")
-        axes[i] = order_types(concretes)
+        keep = Any[]
+        for T in unique(inferred[i])
+            T isa Type || continue
+            T === Any && !show_any && continue
+            if isconcretetype(T)
+                push!(keep, T)
+            elseif show_abstracts && !_is_type_of_type(T)
+                push!(keep, T)
+            end
+        end
+        isempty(keep) && error(
+            "No axis types found at position $i among `$f`'s " *
+            "$ndims-argument methods; pass explicit `types`.")
+        axes[i] = order_types(keep)
     end
     return axes
 end
@@ -127,13 +139,17 @@ colours stable across refreshes.
 """
 function build_model(f, provided::Union{Nothing,Vector{Vector{Any}}};
                      order::IdDict{Method,Int} = IdDict{Method,Int}(),
-                     arity::Union{Nothing,Int} = nothing)
+                     arity::Union{Nothing,Int} = nothing,
+                     show_abstracts::Bool = true, show_any::Bool = true,
+                     show_unions::Bool = true)
     ndims = provided !== nothing ? length(provided) :
             arity !== nothing ? arity : infer_ndims(f)
     1 <= ndims <= 3 ||
         error("DispatchDisplay supports 1–3 arguments; got $ndims.")
 
-    axes = build_axes(f, provided, ndims)
+    axes = build_axes(f, provided, ndims;
+                      show_abstracts = show_abstracts, show_any = show_any,
+                      show_unions = show_unions)
     brackets = [axis_brackets(f, axes[i], i, ndims) for i in 1:ndims]
 
     allmethods = collect(methods(f))

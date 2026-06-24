@@ -28,8 +28,20 @@ end
 """Number of declared positional arguments (function slot excluded)."""
 arity(m::Method) = length(arg_types(m))
 
-"""Split a `Union` into its component types; everything else passes through."""
-expand_union(@nospecialize t) = t isa Union ? collect(Base.uniontypes(t)) : Any[t]
+"""
+Split a `Union` into its component types; everything else passes through.
+
+Handles `UnionAll`-wrapped Unions too (e.g.
+`Union{Adjoint{T,V}, Transpose{T,V}} where {T, V<:AbstractVector}`): the body
+is unwrapped, then each constituent is rewrapped with the original `where`s so
+the returned types remain valid (no free TypeVars).
+"""
+function expand_union(@nospecialize t)
+    body = t isa UnionAll ? Base.unwrap_unionall(t) : t
+    body isa Union || return Any[t]
+    return Any[t isa UnionAll ? Base.rewrap_unionall(p, t) : p
+               for p in Base.uniontypes(body)]
+end
 
 """
     infer_ndims(f) -> Int
@@ -53,19 +65,28 @@ function infer_ndims(f)
 end
 
 """
-    infer_axes(f, ndims) -> Vector{Vector{Any}}
+    infer_axes(f, ndims; include_unions=false) -> Vector{Vector{Any}}
 
 Collect, per argument position, every type literally mentioned in the
-signatures of `f`'s `ndims`-argument methods (Unions expanded).
+signatures of `f`'s `ndims`-argument methods. Unions are always expanded into
+their constituents; with `include_unions`, the Union itself is also added as
+an axis entry (so a single faded cell can stand in for the whole Union).
 """
-function infer_axes(f, ndims::Int)
+function infer_axes(f, ndims::Int; include_unions::Bool = false)
     axes = [Any[] for _ in 1:ndims]
     for m in methods(f)
         isvararg(m) && continue
         ats = arg_types(m)
         length(ats) == ndims || continue
-        for i in 1:ndims, t in expand_union(ats[i])
-            push!(axes[i], t)
+        for i in 1:ndims
+            t = ats[i]
+            for p in expand_union(t)
+                push!(axes[i], p)
+            end
+            if include_unions
+                body = t isa UnionAll ? Base.unwrap_unionall(t) : t
+                body isa Union && push!(axes[i], t)
+            end
         end
     end
     return axes

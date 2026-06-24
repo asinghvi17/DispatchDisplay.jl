@@ -7,8 +7,14 @@
 # containment (e.g. `Integer` inside `Real` inside `Number`).
 # ---------------------------------------------------------------------------
 
-supertype_safe(@nospecialize t) =
+function supertype_safe(@nospecialize t)
+    # `supertype` is undefined for `Union`s (and `UnionAll`s whose body is a
+    # `Union`); for ordering purposes such types simply sit directly under `Any`.
+    if t isa UnionAll
+        Base.unwrap_unionall(t) isa Union && return Any
+    end
     (t isa DataType || t isa UnionAll) ? supertype(t) : Any
+end
 
 """`true` for `Type{X}`/`Type{<:X}` (a type whose instances are themselves types)."""
 _is_type_of_type(@nospecialize T) = try
@@ -73,8 +79,14 @@ function axis_brackets(f, axisvec, dim::Int, ndims::Int)
 
     spans = Tuple{Any,Int,Int}[]
     for T in unique(abstracts)
-        idxs = [i for (i, U) in enumerate(axisvec) if U !== T && U isa Type && U <: T]
-        isempty(idxs) && continue
+        # A bracket needs at least one *strict* subtype on the axis — otherwise
+        # the bracket just hugs T's own axis tick, which is redundant. When T is
+        # itself on the axis, include its index in the span so the bracket
+        # visibly originates at the abstract-type cell.
+        strict = [i for (i, U) in enumerate(axisvec) if U isa Type && U !== T && U <: T]
+        isempty(strict) && continue
+        own = findfirst(U -> U === T, axisvec)
+        idxs = own === nothing ? strict : vcat(strict, own)
         push!(spans, (T, minimum(idxs), maximum(idxs)))
     end
 

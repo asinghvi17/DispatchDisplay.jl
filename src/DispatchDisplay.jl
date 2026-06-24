@@ -39,6 +39,9 @@ mutable struct DispatchDisplayResult
     f::Any
     provided::Union{Nothing,Vector{Vector{Any}}}
     arity::Union{Nothing,Int}
+    show_abstracts::Bool
+    show_any::Bool
+    show_unions::Bool
     figure::Makie.Figure
     model::Base.RefValue{DispatchModel}
     order::IdDict{Method,Int}   # persistent method→colour index (stable colours)
@@ -122,28 +125,42 @@ dispatchdisplay(foo, [Int, Float64, String], [Int, Float64, String])
 ```
 
 giving a 2D grid.  Provide one vector for a 1D strip and three for a 3D sliced
-view.  Axes always hold **concrete** types only; abstract types appear as method
-colours and as subtype brackets, never as cells.
+view.  When `types` are provided, they are used as-is — abstract entries are
+allowed and rendered with a faded fill.
 
-With no `types`, the concrete types are inferred from `f`'s method signatures and
-the dimensionality from its most common arity — pass `arity` to force it. This
-is the "whole operator" mode, e.g. `dispatchdisplay(+; arity=2)` or, for a tidy
-numeric grid, `dispatchdisplay(+, numeric_types(), numeric_types())`.
+With no `types`, the axis types are inferred from `f`'s method signatures and
+the dimensionality from its most common arity — pass `arity` to force it. By
+default this includes both concrete types and the abstract types that appear in
+the signatures (so every method shows up, including the catch-all `Any` cell
+when a method uses it). Toggles (inferred axes only — `provided` types are
+never filtered):
+
+* `show_abstracts=false` — concrete types only.
+* `show_any=false` — drop the `Any` cell.
+* `show_unions=false` — don't add each `Union{...}` signature as its own axis
+  cell (the constituents are still expanded onto the axis either way).
 
 Hover a cell to highlight the owning method in the legend (and, when method
-sources are long, show the source). Method colours are stable: defining new
-methods never reshuffles existing ones.
+sources are long, show the source). Cells whose axis type is abstract are
+rendered with reduced alpha. Method colours are stable: defining new methods
+never reshuffles existing ones.
 """
-function dispatchdisplay(f, types...; arity = nothing, size = nothing)
+function dispatchdisplay(f, types...; arity = nothing, size = nothing,
+                         show_abstracts::Bool = true, show_any::Bool = true,
+                         show_unions::Bool = true)
     provided = isempty(types) ? nothing :
                Vector{Vector{Any}}([collect(Any, t) for t in types])
     order = IdDict{Method,Int}()
-    model = build_model(f, provided; order = order, arity = arity)
+    model = build_model(f, provided; order = order, arity = arity,
+                        show_abstracts = show_abstracts, show_any = show_any,
+                        show_unions = show_unions)
     # A 1D strip needs far less height than a 2D/3D grid.
     fsize = size !== nothing ? size :
             model.ndims == 1 ? (660, 400) : (660, 880)
     fig = Makie.Figure(; size = fsize)
-    d = DispatchDisplayResult(f, provided, arity, fig, Ref(model), order)
+    d = DispatchDisplayResult(f, provided, arity,
+                              show_abstracts, show_any, show_unions,
+                              fig, Ref(model), order)
     _render!(d)
     return d
 end
@@ -154,7 +171,9 @@ end
 Re-query `f`'s methods, re-expand the type space, and redraw in place.
 """
 function refresh!(d::DispatchDisplayResult)
-    d.model[] = build_model(d.f, d.provided; order = d.order, arity = d.arity)
+    d.model[] = build_model(d.f, d.provided; order = d.order, arity = d.arity,
+                            show_abstracts = d.show_abstracts, show_any = d.show_any,
+                            show_unions = d.show_unions)
     _render!(d)
     return d
 end

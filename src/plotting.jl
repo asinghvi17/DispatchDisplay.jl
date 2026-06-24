@@ -10,6 +10,14 @@
 
 const HINT = "Hover a cell to see which method it dispatches to."
 const INLINE_MAXLEN = 66   # max source length to show inline in the legend
+const ABSTRACT_ALPHA = 0.5 # fill alpha for cells whose axis type is abstract
+
+"""`true` when `T` is an abstract axis entry (so its cell should be faded)."""
+is_abstract_axis(@nospecialize T) =
+    T isa Type && !isconcretetype(T)
+
+"""Fade a fill colour to mark a cell whose axis type is abstract."""
+fade(c::Makie.RGBAf) = Makie.RGBAf(c.r, c.g, c.b, c.alpha * ABSTRACT_ALPHA)
 
 """Drop module qualifiers and truncate, keeping labels short (full name on hover)."""
 function _shorten(s::AbstractString; maxlen::Int = 22)
@@ -47,20 +55,22 @@ cell_sig(model, types) =
 """Multi-line description of a cell, shown in the hover panel (non-inline mode)."""
 function describe_cell(model::DispatchModel, v::Integer, types)
     sig = cell_sig(model, types)
+    note = any(is_abstract_axis, types) ?
+           "\n(faded: at least one axis type is abstract.)" : ""
     if v > 0
         m = model.methodlist[v]
         src = method_source(m)
         body = src === nothing ? method_label(m, funcname(model.f)) : src
         return string("● ", sig, "  →  dispatches to:\n", body,
-            "\n@ ", basename(string(m.file)), ":", m.line)
+            "\n@ ", basename(string(m.file)), ":", m.line, note)
     elseif v == 0
-        return string("✖ ", sig, "\nMethodError — no applicable method (uncovered).")
+        return string("✖ ", sig, "\nMethodError — no applicable method (uncovered).", note)
     elseif v == -2
         return string("◐ ", sig,
-            "\nPartial — some concrete subtypes dispatch, others don't.")
+            "\nPartial — some concrete subtypes dispatch, others don't.", note)
     else
         return string("⚠ ", sig,
-            "\nAmbiguous — several equally-specific methods, none most specific.")
+            "\nAmbiguous — several equally-specific methods, none most specific.", note)
     end
 end
 
@@ -102,6 +112,10 @@ function legend_rows(model::DispatchModel)
     end
     if any(==(-1), model.grid)
         push!(rows, (AMBIGUOUS, "ambiguous")); v2r[-1] = length(rows)
+    end
+    if any(is_abstract_axis, Iterators.flatten(model.axes))
+        push!(rows, (Makie.RGBAf(0.45, 0.45, 0.45, ABSTRACT_ALPHA),
+                     "faded fill — abstract-type axis"))
     end
     return rows, v2r, inline
 end
@@ -181,7 +195,12 @@ function plot_1d!(pos, model, hovered, info, infocolor, v2r)
         yticksvisible = false, yticklabelsvisible = false,
         aspect = Makie.DataAspect())
     Makie.hidespines!(ax)
-    cols = reshape([color_for(model, v) for v in model.grid], n, 1)
+    abs1 = is_abstract_axis.(model.axes[1])
+    cols = Matrix{Makie.RGBAf}(undef, n, 1)
+    for i in 1:n
+        c = color_for(model, model.grid[i])
+        cols[i, 1] = abs1[i] ? fade(c) : c
+    end
     Makie.image!(ax, (0.5, n + 0.5), (0.5, 1.5), cols; interpolate = false)
     cell_borders!(ax, n, 1)
     draw_brackets_x!(ax, bx, 1.55, step)
@@ -225,7 +244,13 @@ function plot_2d!(pos, model, hovered, info, infocolor, v2r)
         xticklabelrotation = pi / 4, xgridvisible = false, ygridvisible = false,
         aspect = Makie.DataAspect())
     Makie.hidespines!(ax)
-    cols = [color_for(model, model.grid[i, j]) for i in 1:nx, j in 1:ny]
+    abs1 = is_abstract_axis.(model.axes[1])
+    abs2 = is_abstract_axis.(model.axes[2])
+    cols = Matrix{Makie.RGBAf}(undef, nx, ny)
+    for i in 1:nx, j in 1:ny
+        c = color_for(model, model.grid[i, j])
+        cols[i, j] = (abs1[i] || abs2[j]) ? fade(c) : c
+    end
     Makie.image!(ax, (0.5, nx + 0.5), (0.5, ny + 0.5), cols; interpolate = false)
     if !big
         cell_borders!(ax, nx, ny)
@@ -260,14 +285,18 @@ function plot_3d!(pos, model, hovered, info, infocolor, v2r)
     thick = 0.7          # arg₁ thickness of each slice (< pitch ⇒ a visible gap)
     cellalpha = 0.85     # slightly translucent so neighbours behind show through
 
+    abs1 = is_abstract_axis.(model.axes[1])
+    abs2 = is_abstract_axis.(model.axes[2])
+    abs3 = is_abstract_axis.(model.axes[3])
     pts = Makie.Point3f[]; cols = Makie.RGBAf[]
     cellinfo = Tuple{Int,NTuple{3,Any}}[]
     for i in 1:nx, j in 1:ny, k in 1:nz
         v = model.grid[i, j, k]
         v == 0 && continue                       # gap for uncovered cells
         c = color_for(model, v)
+        a = cellalpha * ((abs1[i] || abs2[j] || abs3[k]) ? ABSTRACT_ALPHA : 1.0)
         push!(pts, Makie.Point3f(i * pitch, j, k))
-        push!(cols, Makie.RGBAf(c.r, c.g, c.b, c.alpha * cellalpha))
+        push!(cols, Makie.RGBAf(c.r, c.g, c.b, c.alpha * a))
         push!(cellinfo, (v, (model.axes[1][i], model.axes[2][j], model.axes[3][k])))
     end
 

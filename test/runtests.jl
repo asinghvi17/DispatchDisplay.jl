@@ -3,6 +3,7 @@ using DispatchDisplay: build_model, cell_owner, arity, infer_ndims,
     order_types, axis_brackets, type_chain, arg_types, method_source,
     legend_rows, describe_cell
 using CairoMakie  # headless backend for rendering tests
+using LinearAlgebra: Adjoint, Transpose
 using Test
 
 # A toy function exercising concrete, abstract, and uncovered combinations.
@@ -112,15 +113,51 @@ end
     @test all(T -> T isa Type && isconcretetype(T), numeric_types())
     @test all(T -> T isa Type && isconcretetype(T), matrix_types())
 
-    # Inferred arity mode: axes hold only concrete types; abstract sig types
-    # (here Number) become a bracket, never a cell.
+    # Inferred arity mode, default: axes hold both the concrete types appearing
+    # in signatures AND the abstract types that own methods. `Number` shows up
+    # both as an axis cell and as the bracket spanning Number-subtype cells.
     h(x::Int, y::Int) = 1
     h(x::Number, y::Number) = 2
     m = build_model(h, nothing; arity = 2)
     @test m.ndims == 2
-    @test all(isconcretetype, m.axes[1])
-    @test !(Number in m.axes[1])
+    @test Number in m.axes[1]
+    @test Int in m.axes[1]
     @test any(b -> b.label == "Number", m.brackets[1])
+    # The Number bracket should include the Number axis cell itself.
+    numbr = only(b for b in m.brackets[1] if b.label == "Number")
+    @test m.axes[1][numbr.lo] === Number || m.axes[1][numbr.hi] === Number
+
+    # `show_abstracts=false` restores the old concrete-only behaviour.
+    mc = build_model(h, nothing; arity = 2, show_abstracts = false)
+    @test all(isconcretetype, mc.axes[1])
+    @test !(Number in mc.axes[1])
+    @test any(b -> b.label == "Number", mc.brackets[1])
+
+    # `show_any` toggle: by default the catch-all `Any` cell is included when
+    # a method uses it; opt out with `show_any=false`.
+    hany(x::Any) = 1
+    hany(x::Int) = 2
+    @test  (Any in build_model(hany, nothing; arity = 1).axes[1])
+    @test !(Any in build_model(hany, nothing; arity = 1, show_any = false).axes[1])
+
+    # Unions in signatures: constituents are always expanded onto the axis,
+    # and by default the Union itself is also included as its own axis cell.
+    # Parametric Unions (`UnionAll` wrapping a Union) used to crash chainkey
+    # via `supertype(::Type{Union{...}})` — make sure they don't anymore.
+    huni(x::Union{Float32,Float64}) = 1
+    @test  (Float32 in build_model(huni, nothing; arity = 1).axes[1])
+    @test  (Float64 in build_model(huni, nothing; arity = 1).axes[1])
+    @test  (Union{Float32,Float64} in build_model(huni, nothing; arity = 1).axes[1])
+    # Opt out with `show_unions=false`: only the constituents remain.
+    @test !(Union{Float32,Float64} in
+            build_model(huni, nothing; arity = 1, show_unions = false).axes[1])
+
+    # The crashy case: `Union{...} where {T,V<:AbstractVector}` — must just work.
+    hpar(x::Union{Adjoint{T,V},Transpose{T,V}}) where {T,V<:AbstractVector} = 1
+    hpar(x::Vector) = 2
+    @test build_model(hpar, nothing; arity = 1) isa DispatchDisplay.DispatchModel
+    @test build_model(hpar, nothing; arity = 1, show_unions = true) isa
+          DispatchDisplay.DispatchModel
 
     # Level-of-detail ticks: hidden when too many are visible, listed otherwise.
     names = string.(1:40)
