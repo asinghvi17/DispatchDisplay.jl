@@ -42,6 +42,10 @@ mutable struct DispatchDisplayResult
     show_abstracts::Bool
     show_any::Bool
     show_unions::Bool
+    # Live UI visibility toggles (flipped by the toggle widgets in the figure).
+    show_legend_ui::Bool
+    show_panel_ui::Bool
+    show_trees_ui::Bool
     figure::Makie.Figure
     model::Base.RefValue{DispatchModel}
     order::IdDict{Method,Int}   # persistent method→colour index (stable colours)
@@ -84,8 +88,10 @@ function _render!(d::DispatchDisplayResult)
     # Past ~16 methods (e.g. a whole operator), a legend is hopeless — drop it
     # and identify methods by hovering instead (a zoomable "dispatch map").
     manymethods = nmethods > 16
-    showpanel = nmethods > 0 && (manymethods || !inline)
-    showlegend = !isempty(rows) && !manymethods
+    # UI visibility = data-driven default AND user toggle.
+    showpanel = d.show_panel_ui && nmethods > 0 && (manymethods || !inline)
+    showlegend = d.show_legend_ui && !isempty(rows) && !manymethods
+    show_axis_labels = !d.show_trees_ui
 
     # Top region: grid + linked sibling axes that draw the per-dimension DAG.
     # Everything lives directly in `fig.layout` (no nested GridLayouts — they
@@ -93,38 +99,81 @@ function _render!(d::DispatchDisplayResult)
     # tree row + main row. 2D = 2×2 (corner blank / x-tree, y-tree / main).
     # 3D = main only for now; linked Axis3 trees come in a follow-up.
     r = 1
+    fname = funcname(model.f)
+    # Title gets its own row above the trees so it never collides with
+    # Fixed-sized tree rows (axis titles inside a Fixed row tend to clip).
+    title_row_used = false
     if model.ndims == 1
         tree1 = model.trees[1]
-        if any(tree1.expandable)
-            ax_main = plot_main!(fig[2, 1], model, hovered, info, infocolor, v2r)
-            tree_axis_top!(fig[1, 1], tree1, length(model.axes[1]), ax_main)
-            Makie.rowsize!(fig.layout, 1, Makie.Fixed(tree_height(tree1) * 56.0 + 40.0))
-            r = 2
+        showtree = d.show_trees_ui && any(tree1.expandable)
+        if showtree
+            Makie.Label(fig[1, 1], "$fname(arg₁)";
+                fontsize = 16, font = :bold, halign = :center)
+            Makie.rowsize!(fig.layout, 1, Makie.Fixed(24.0))
+            title_row_used = true
+            ax_main = plot_main!(fig[3, 1], model, hovered, info, infocolor;
+                                 show_title = false, show_axis_labels = false)
+            tree_axis_top!(fig[2, 1], tree1, length(model.axes[1]), ax_main; title = "")
+            Makie.rowsize!(fig.layout, 2, Makie.Fixed(tree_height(tree1) * 56.0 + 40.0))
+            Makie.rowgap!(fig.layout, 2, 0)
+            r = 4
         else
-            plot_main!(fig[1, 1], model, hovered, info, infocolor, v2r)
+            plot_main!(fig[1, 1], model, hovered, info, infocolor;
+                       show_axis_labels = show_axis_labels)
         end
     elseif model.ndims == 2
         tx, ty = model.trees[1], model.trees[2]
-        showtx, showty = any(tx.expandable), any(ty.expandable)
-        main_row, main_col = showtx ? 2 : 1, showty ? 2 : 1
-        ax_main = plot_main!(fig[main_row, main_col], model, hovered, info, infocolor, v2r)
+        showtx = d.show_trees_ui && any(tx.expandable)
+        showty = d.show_trees_ui && any(ty.expandable)
+        # Title in its own dedicated row; tree row is just the tree.
+        title_h = 24.0
+        main_row = showtx ? 3 : 2
+        main_col = showty ? 2 : 1
+        Makie.Label(fig[1, main_col], "$fname(arg₁, arg₂)";
+            fontsize = 16, font = :bold, halign = :center)
+        Makie.rowsize!(fig.layout, 1, Makie.Fixed(title_h))
+        title_row_used = true
+        nx, ny = length(model.axes[1]), length(model.axes[2])
+        xt_h = showtx ? tree_height(tx) * 56.0 + 40.0 : 0.0
+        yt_w = showty ? tree_height(ty) * 36.0 + 110.0 : 0.0
+        # Pixel budget for the grid: figure size minus tree axes and the
+        # below-grid stack (hover panel + legend + refresh + paddings). The
+        # grid is then sized to `cellpx × nx` wide and `cellpx × ny` tall so
+        # `DataAspect` keeps every cell square without leaving whitespace.
+        fw, fh = Tuple(fig.scene.viewport[].widths)
+        below_h = (showpanel ? 96.0 : 0.0) +
+                  (showlegend ? legend_layout(length(rows))[2] * 24.0 + 30.0 : 0.0) +
+                  44.0 +                                    # toggle row + refresh
+                  title_h +                                 # title row
+                  10.0 * 6 +                                # default rowgaps
+                  28.0                                      # figure top+bottom padding
+        avail_w = max(80.0, fw - yt_w - 30.0)
+        avail_h = max(80.0, fh - xt_h - below_h)
+        cellpx = max(16.0, min(avail_w / nx, avail_h / ny))
+        ax_main = plot_main!(fig[main_row, main_col], model, hovered, info, infocolor;
+                             show_title = false,
+                             show_axis_labels = show_axis_labels)
         if showtx
-            tree_axis_top!(fig[1, main_col], tx, length(model.axes[1]), ax_main)
-            Makie.rowsize!(fig.layout, 1, Makie.Fixed(tree_height(tx) * 56.0 + 40.0))
+            tree_axis_top!(fig[2, main_col], tx, nx, ax_main; title = "")
+            Makie.rowsize!(fig.layout, 2, Makie.Fixed(xt_h))
+            Makie.rowgap!(fig.layout, 2, 0)
         end
         if showty
-            tree_axis_left!(fig[main_row, 1], ty, length(model.axes[2]), ax_main)
-            Makie.colsize!(fig.layout, 1, Makie.Fixed(tree_height(ty) * 36.0 + 110.0))
+            tree_axis_left!(fig[main_row, 1], ty, ny, ax_main)
+            Makie.colsize!(fig.layout, 1, Makie.Fixed(yt_w))
+            Makie.colgap!(fig.layout, 1, 0)
         end
+        Makie.colsize!(fig.layout, main_col, Makie.Fixed(cellpx * nx))
+        Makie.rowsize!(fig.layout, main_row, Makie.Fixed(cellpx * ny))
         r = main_row + 1
     else  # 3D — main only for now
-        plot_main!(fig[1, 1], model, hovered, info, infocolor, v2r)
+        plot_main!(fig[1, 1], model, hovered, info, infocolor)
         r = 2
     end
     # Below-grid stuff spans both columns (so the hover panel/legend cover the
     # full width when a y-tree column is present).
 
-    span = model.ndims == 2 && any(model.trees[2].expandable) ? (1:2) : (1:1)
+    span = model.ndims == 2 && d.show_trees_ui && any(model.trees[2].expandable) ? (1:2) : (1:1)
     if showpanel
         # A tinted box behind the text, coloured by the hovered tile's method.
         boxc = Makie.lift(c -> Makie.RGBAf(c.r, c.g, c.b, 0.18 * c.alpha), infocolor)
@@ -135,12 +184,35 @@ function _render!(d::DispatchDisplayResult)
         Makie.rowsize!(fig.layout, r, Makie.Fixed(96.0)); r += 1
     end
     if showlegend
-        make_legend!(fig[r, span], model, rows, hovered, infocolor)
+        make_legend!(fig[r, span], model, rows, hovered, infocolor, v2r)
         Makie.rowsize!(fig.layout, r, Makie.Fixed(legend_layout(length(rows))[2] * 24 + 30.0))
         r += 1
     end
-    btn = Makie.Button(fig[r, span]; label = "⟳ Refresh", tellwidth = false)
-    Makie.rowsize!(fig.layout, r, Makie.Fixed(34.0))
+    # Toggle row: small switches to hide/show trees, legend, hover panel —
+    # plus the Refresh button. Toggling re-renders without rebuilding the
+    # model; Refresh re-queries methods(f) (use it after defining new methods).
+    ctrl = Makie.GridLayout(fig[r, span]; tellheight = false)
+    trees_t  = Makie.Toggle(ctrl[1, 1]; active = d.show_trees_ui,  width = 28)
+    Makie.Label(ctrl[1, 2], "trees"; halign = :left)
+    legend_t = Makie.Toggle(ctrl[1, 3]; active = d.show_legend_ui, width = 28)
+    Makie.Label(ctrl[1, 4], "legend"; halign = :left)
+    panel_t  = Makie.Toggle(ctrl[1, 5]; active = d.show_panel_ui,  width = 28)
+    Makie.Label(ctrl[1, 6], "panel"; halign = :left)
+    btn = Makie.Button(ctrl[1, 7]; label = "⟳ Refresh")
+    Makie.colgap!(ctrl, 6)
+    Makie.rowsize!(fig.layout, r, Makie.Fixed(40.0))
+    Makie.on(trees_t.active) do v
+        v == d.show_trees_ui && return
+        d.show_trees_ui = v; _render!(d)
+    end
+    Makie.on(legend_t.active) do v
+        v == d.show_legend_ui && return
+        d.show_legend_ui = v; _render!(d)
+    end
+    Makie.on(panel_t.active) do v
+        v == d.show_panel_ui && return
+        d.show_panel_ui = v; _render!(d)
+    end
     Makie.on(btn.clicks) do _
         refresh!(d)
     end
@@ -191,9 +263,10 @@ function dispatchdisplay(f, types...; arity = nothing, size = nothing,
     # A 1D strip needs far less height than a 2D/3D grid.
     fsize = size !== nothing ? size :
             model.ndims == 1 ? (660, 400) : (660, 880)
-    fig = Makie.Figure(; size = fsize)
+    fig = Makie.Figure(; size = fsize, figure_padding = 14)
     d = DispatchDisplayResult(f, provided, arity,
                               show_abstracts, show_any, show_unions,
+                              true, true, true,           # UI: legend / panel / trees all on
                               fig, Ref(model), order)
     _render!(d)
     return d

@@ -202,39 +202,49 @@ function _tree_node_positions(tree::AxisTree, axis_count::Int)
     return pos
 end
 
-_push_seg!(segs, x1, y1, x2, y2, swap::Bool) = swap ?
-    (push!(segs, Makie.Point2f(y1, x1), Makie.Point2f(y2, x2))) :
-    (push!(segs, Makie.Point2f(x1, y1), Makie.Point2f(x2, y2)))
-
-# Reserved data-unit "label band" above each x-tree node: drops stop at the
-# top of this band so the connector points down to the label without slicing
-# through it. Sized to comfortably clear the default ~14px label height with
-# the per-depth pixel sizing used in `_render!`.
+# Reserved data-unit "label band" above each x-tree leaf node: edges stop at
+# the top of this band so they point to the label without slicing through it.
+# Roughly matches the ~14px label height under the per-depth pixel sizing used
+# in `_render!`.
 const LABEL_BAND = 0.35
 
-"""DAG edge segments — squared connectors from parent's `(pos, depth)` over a
-cross-bar at `depth - 0.5` down toward each child. Drops stop above the
-child's `LABEL_BAND` so the connector visually points to the label without
-running through it."""
-function _tree_edge_segments(tree::AxisTree, node_pos::Vector{Float64}; swap::Bool)
+"""Straight-line DAG edge segments for the x-tree (depth runs on y, axis
+position on x). Each parent→child pair produces one line, ending above the
+child's label band so the connector visually points at the label without
+crossing it. Multi-parent children naturally get one slanted line per parent."""
+function _tree_edges_x(tree::AxisTree, node_pos::Vector{Float64})
     D = tree_depth(tree)
     segs = Makie.Point2f[]
     for p in 1:length(tree.children)
         ch = tree.children[p]
         isempty(ch) && continue
-        depth_p = float(D - tree.depth[p] + 1)
-        cb = depth_p - 0.5
-        xp = node_pos[p]
-        _push_seg!(segs, xp, depth_p, xp, cb, swap)
-        xmin = float(min(xp, minimum(node_pos[c] for c in ch)))
-        xmax = float(max(xp, maximum(node_pos[c] for c in ch)))
-        _push_seg!(segs, xmin, cb, xmax, cb, swap)
+        x_p = node_pos[p]
+        y_p = float(D - tree.depth[p] + 1)
         for c in ch
-            drop_end = float(D - tree.depth[c] + 1) + LABEL_BAND
-            # Don't draw a degenerate-or-inverted drop when the cross-bar
-            # already sits inside the label band (deep trees, tight spacing).
-            drop_end < cb || continue
-            _push_seg!(segs, node_pos[c], cb, node_pos[c], drop_end, swap)
+            x_c = node_pos[c]
+            y_c = float(D - tree.depth[c] + 1) + LABEL_BAND
+            y_c < y_p || continue        # degenerate / inverted: skip
+            push!(segs, Makie.Point2f(x_p, y_p), Makie.Point2f(x_c, y_c))
+        end
+    end
+    return segs
+end
+
+"""Straight-line DAG edge segments for the y-tree (depth runs on negative x,
+axis position on y). Labels live to the left of each node, so edges ending at
+the node's x don't intersect any label."""
+function _tree_edges_y(tree::AxisTree, node_pos::Vector{Float64})
+    D = tree_depth(tree)
+    segs = Makie.Point2f[]
+    for p in 1:length(tree.children)
+        ch = tree.children[p]
+        isempty(ch) && continue
+        x_p = -float(D - tree.depth[p] + 1)
+        y_p = node_pos[p]
+        for c in ch
+            x_c = -float(D - tree.depth[c] + 1)
+            y_c = node_pos[c]
+            push!(segs, Makie.Point2f(x_p, y_p), Makie.Point2f(x_c, y_c))
         end
     end
     return segs
@@ -242,13 +252,15 @@ end
 
 """Create a sibling x-tree `Axis` above `main`, sharing its x-coordinate.
 
-Tree depth runs upward (root at the top, leaves just above the grid). Labels
-sit above their nodes — no rotation, since each label has a full row of its
-own and the depth-spacing keeps them from stacking vertically.
+Tree depth runs upward (root at the top, leaves just above the grid). Floating
+nodes' labels sit above their nodes; leaf labels are rotated 45° below the
+leaf node so they replace the main grid's x-tick labels.
 """
-function tree_axis_top!(pos, tree::AxisTree, axis_count::Int, main::Makie.Axis)
+function tree_axis_top!(pos, tree::AxisTree, axis_count::Int, main::Makie.Axis;
+                        title::AbstractString = "")
     D = tree_depth(tree)
     ax = Makie.Axis(pos;
+        title = title,
         xticks = (Float64[], String[]), xticklabelsvisible = false,
         xticksvisible = false, xgridvisible = false,
         yticks = (Float64[], String[]), yticklabelsvisible = false,
@@ -256,20 +268,33 @@ function tree_axis_top!(pos, tree::AxisTree, axis_count::Int, main::Makie.Axis)
     Makie.hidespines!(ax)
     Makie.linkxaxes!(main, ax)
     node_pos = _tree_node_positions(tree, axis_count)
-    segs = _tree_edge_segments(tree, node_pos; swap = false)
+    segs = _tree_edges_x(tree, node_pos)
     isempty(segs) ||
         Makie.linesegments!(ax, segs; color = TREE_COLOR, linewidth = TREE_LINEWIDTH)
     for k in 1:length(tree.nodes)
         T = tree.nodes[k]
         T isa Type || continue
         y = float(D - tree.depth[k] + 1)
-        Makie.text!(ax, node_pos[k], y;
-            text = _shorten(typelabel(T); maxlen = TREE_NAME_MAXLEN),
-            color = _label_color(T, tree.has_method[k]),
-            align = (:center, :bottom), fontsize = 11,
-            offset = (0.0f0, 4.0f0))   # small gap from the connector line
+        is_leaf = tree.axis_idx[k] !== nothing
+        if is_leaf
+            # Leaf labels act as grid x-tick labels — horizontal, anchored
+            # to top-center so they hang below the leaf node toward the grid.
+            Makie.text!(ax, node_pos[k], y;
+                text = _shorten(typelabel(T); maxlen = TREE_NAME_MAXLEN),
+                color = _label_color(T, tree.has_method[k]),
+                align = (:center, :top), fontsize = 11,
+                offset = (0.0f0, -4.0f0))
+        else
+            Makie.text!(ax, node_pos[k], y;
+                text = _shorten(typelabel(T); maxlen = TREE_NAME_MAXLEN),
+                color = _label_color(T, tree.has_method[k]),
+                align = (:center, :bottom), fontsize = 11,
+                offset = (0.0f0, 4.0f0))
+        end
     end
-    Makie.ylims!(ax, 0.5, D + 1.8)
+    # Extend ylims downward so the rotated leaf labels (which hang below the
+    # leaf nodes at y=1) fit inside the axis viewport without clipping.
+    Makie.ylims!(ax, -0.6, D + 1.8)
     return ax
 end
 
@@ -289,37 +314,23 @@ function tree_axis_left!(pos, tree::AxisTree, axis_count::Int, main::Makie.Axis)
     Makie.hidespines!(ax)
     Makie.linkyaxes!(main, ax)
     node_pos = _tree_node_positions(tree, axis_count)
-    # Flip depths into negative x so the root (depth 0) is leftmost and leaves
-    # sit just to the left of the grid. The edge-segment helper consumes the
-    # same "tree depth coord" used for label placement, so we flip there too.
-    segs = Makie.Point2f[]
-    for p in 1:length(tree.children)
-        ch = tree.children[p]
-        isempty(ch) && continue
-        xp = -float(D - tree.depth[p] + 1)
-        cb = xp + 0.5
-        push!(segs, Makie.Point2f(xp, node_pos[p]), Makie.Point2f(cb, node_pos[p]))
-        ymin = float(min(node_pos[p], minimum(node_pos[c] for c in ch)))
-        ymax = float(max(node_pos[p], maximum(node_pos[c] for c in ch)))
-        push!(segs, Makie.Point2f(cb, ymin), Makie.Point2f(cb, ymax))
-        for c in ch
-            xc = -float(D - tree.depth[c] + 1)
-            push!(segs, Makie.Point2f(cb, node_pos[c]), Makie.Point2f(xc, node_pos[c]))
-        end
-    end
+    segs = _tree_edges_y(tree, node_pos)
     isempty(segs) ||
         Makie.linesegments!(ax, segs; color = TREE_COLOR, linewidth = TREE_LINEWIDTH)
     for k in 1:length(tree.nodes)
         T = tree.nodes[k]
         T isa Type || continue
         x = -float(D - tree.depth[k] + 1)
-        # Label baseline sits a few px above the stalk so the horizontal
-        # connector at y=node_pos doesn't slice through the text.
+        is_leaf = tree.axis_idx[k] !== nothing
+        # Leaves act as grid y-tick labels (centered on the row); floating
+        # nodes still sit slightly above their edge so the diagonal connector
+        # doesn't run through the label baseline.
+        align = is_leaf ? (:right, :center) : (:right, :bottom)
+        offset = is_leaf ? (-4.0f0, 0.0f0) : (-4.0f0, 3.0f0)
         Makie.text!(ax, x, node_pos[k];
             text = _shorten(typelabel(T); maxlen = TREE_NAME_MAXLEN),
             color = _label_color(T, tree.has_method[k]),
-            align = (:right, :bottom), fontsize = 11,
-            offset = (-4.0f0, 3.0f0))
+            align = align, fontsize = 11, offset = offset)
     end
     # Left pad enough for the widest *root-level* label (those extend furthest
     # left). Char-to-data-unit is a heuristic; the figure colsize compensates.
@@ -372,14 +383,21 @@ end
 
 # --- per-dimension plots ----------------------------------------------------
 
-function plot_1d!(pos, model, hovered, info, infocolor, v2r)
+function plot_1d!(pos, model, hovered, info, infocolor;
+                  show_title::Bool = true, show_axis_labels::Bool = false)
     n = length(model.axes[1])
     names = typelabel.(model.axes[1])
+    # Tick labels live on the tree axis above by default; when trees are
+    # toggled off, fall back to standard axis tick labels here.
     ax = Makie.Axis(pos;
-        title = "$(funcname(model.f))(arg₁)",
-        xticks = (1:n, names), xticklabelrotation = pi / 4,
-        xgridvisible = false, ygridvisible = false,
-        yticksvisible = false, yticklabelsvisible = false,
+        title = show_title ? "$(funcname(model.f))(arg₁)" : "",
+        xticks = show_axis_labels ? (1:n, names) : (1:n, fill("", n)),
+        xticklabelsvisible = show_axis_labels,
+        xticksvisible = show_axis_labels,
+        xticklabelrotation = pi / 4,
+        xgridvisible = false,
+        yticks = (Float64[], String[]), yticklabelsvisible = false,
+        yticksvisible = false, ygridvisible = false,
         aspect = Makie.DataAspect())
     Makie.hidespines!(ax)
     abs1 = is_abstract_axis.(model.axes[1])
@@ -390,6 +408,21 @@ function plot_1d!(pos, model, hovered, info, infocolor, v2r)
     end
     Makie.image!(ax, (0.5, n + 0.5), (0.5, 1.5), cols; interpolate = false)
     cell_borders!(ax, n, 1)
+    # Highlight overlay: cells whose grid value matches `hovered` get a bright
+    # outline. Both cell-hover and legend-hover drive `hovered`, giving
+    # bidirectional same-method highlighting.
+    highlight_rects = Makie.lift(hovered) do h
+        h <= 0 && return Makie.Rect2f[]
+        out = Makie.Rect2f[]
+        for i in 1:n
+            model.grid[i] == h && push!(out, Makie.Rect2f(i - 0.5, 0.5, 1.0, 1.0))
+        end
+        out
+    end
+    Makie.poly!(ax, highlight_rects;
+        color = Makie.RGBAf(0, 0, 0, 0), strokecolor = (:white, 0.95), strokewidth = 3)
+    Makie.poly!(ax, highlight_rects;
+        color = Makie.RGBAf(0, 0, 0, 0), strokecolor = :black, strokewidth = 1)
     Makie.limits!(ax, 0.5, n + 0.5, 0.5, 1.5)
     Makie.on(Makie.events(ax.scene).mouseposition) do _
         if Makie.is_mouseinside(ax.scene)
@@ -397,7 +430,7 @@ function plot_1d!(pos, model, hovered, info, infocolor, v2r)
             i = round(Int, p[1])
             if 1 <= i <= n && 0.5 <= p[2] <= 1.5
                 v = model.grid[i]
-                hovered[] = get(v2r, v, 0)
+                hovered[] = v
                 info[] = describe_cell(model, v, (model.axes[1][i],))
                 infocolor[] = color_for(model, v)
                 return
@@ -408,16 +441,30 @@ function plot_1d!(pos, model, hovered, info, infocolor, v2r)
     return ax
 end
 
-function plot_2d!(pos, model, hovered, info, infocolor, v2r)
+function plot_2d!(pos, model, hovered, info, infocolor;
+                  show_title::Bool = true, show_axis_labels::Bool = false)
     nx, ny = length(model.axes[1]), length(model.axes[2])
+    big = nx * ny > 600
     namesX = typelabel.(model.axes[1])
     namesY = typelabel.(model.axes[2])
-    big = nx * ny > 600
+    # Tree leaves own the tick labels by default; the trees-off toggle falls
+    # back to standard axis tick labels here. `valign=:top, halign=:left`
+    # anchor the DataAspect-shrunken axis to the tree-adjacent corner;
+    # `alignmode=Outside(0)` strips the default tick/title protrusion margin.
     ax = Makie.Axis(pos;
-        title = "$(funcname(model.f))(arg₁, arg₂)", xlabel = "arg₁", ylabel = "arg₂",
-        xticks = (1:nx, namesX), yticks = (1:ny, namesY),
-        xticklabelrotation = pi / 4, xgridvisible = false, ygridvisible = false,
-        aspect = Makie.DataAspect())
+        title = show_title ? "$(funcname(model.f))(arg₁, arg₂)" : "",
+        xticks = show_axis_labels ? (1:nx, namesX) : (Float64[], String[]),
+        xticklabelsvisible = show_axis_labels,
+        xticksvisible = show_axis_labels,
+        xticklabelrotation = pi / 4,
+        xgridvisible = false,
+        yticks = show_axis_labels ? (1:ny, namesY) : (Float64[], String[]),
+        yticklabelsvisible = show_axis_labels,
+        yticksvisible = show_axis_labels,
+        ygridvisible = false,
+        aspect = Makie.DataAspect(),
+        valign = :top, halign = :left,
+        alignmode = Makie.Outside(0))
     Makie.hidespines!(ax)
     abs1 = is_abstract_axis.(model.axes[1])
     abs2 = is_abstract_axis.(model.axes[2])
@@ -428,15 +475,29 @@ function plot_2d!(pos, model, hovered, info, infocolor, v2r)
     end
     Makie.image!(ax, (0.5, nx + 0.5), (0.5, ny + 0.5), cols; interpolate = false)
     big || cell_borders!(ax, nx, ny)
+    # Bidirectional same-method highlight: cells matching `hovered`'s grid
+    # value get a bright outline (white over black). Driven by both cell
+    # hover (below) and legend hover (in make_legend!).
+    highlight_rects = Makie.lift(hovered) do h
+        h <= 0 && return Makie.Rect2f[]
+        out = Makie.Rect2f[]
+        for i in 1:nx, j in 1:ny
+            model.grid[i, j] == h && push!(out, Makie.Rect2f(i - 0.5, j - 0.5, 1.0, 1.0))
+        end
+        out
+    end
+    Makie.poly!(ax, highlight_rects;
+        color = Makie.RGBAf(0, 0, 0, 0), strokecolor = (:white, 0.95), strokewidth = 3)
+    Makie.poly!(ax, highlight_rects;
+        color = Makie.RGBAf(0, 0, 0, 0), strokecolor = :black, strokewidth = 1)
     Makie.limits!(ax, 0.5, nx + 0.5, 0.5, ny + 0.5)
-    (nx > MAXLABELS || ny > MAXLABELS) && lod_ticks!(ax, namesX, namesY)
     Makie.on(Makie.events(ax.scene).mouseposition) do _
         if Makie.is_mouseinside(ax.scene)
             p = Makie.mouseposition(ax.scene)
             i = round(Int, p[1]); j = round(Int, p[2])
             if 1 <= i <= nx && 1 <= j <= ny
                 v = model.grid[i, j]
-                hovered[] = get(v2r, v, 0)
+                hovered[] = v
                 info[] = describe_cell(model, v, (model.axes[1][i], model.axes[2][j]))
                 infocolor[] = color_for(model, v)
                 return
@@ -447,7 +508,7 @@ function plot_2d!(pos, model, hovered, info, infocolor, v2r)
     return ax
 end
 
-function plot_3d!(pos, model, hovered, info, infocolor, v2r)
+function plot_3d!(pos, model, hovered, info, infocolor)
     nx, ny, nz = size(model.grid)
     namesX = typelabel.(model.axes[1])
     namesY = typelabel.(model.axes[2])
@@ -499,7 +560,7 @@ function plot_3d!(pos, model, hovered, info, infocolor, v2r)
                 plt, idx = Makie.pick(ax.scene)
                 if plt === mp && 1 <= idx <= length(cellinfo)
                     v, types = cellinfo[idx]
-                    hovered[] = get(v2r, v, 0)
+                    hovered[] = v
                     info[] = describe_cell(model, v, types)
                     infocolor[] = color_for(model, v)
                     return
@@ -511,23 +572,26 @@ function plot_3d!(pos, model, hovered, info, infocolor, v2r)
     return ax
 end
 
-function plot_main!(pos, model, hovered, info, infocolor, v2r)
-    model.ndims == 1 && return plot_1d!(pos, model, hovered, info, infocolor, v2r)
-    model.ndims == 2 && return plot_2d!(pos, model, hovered, info, infocolor, v2r)
-    return plot_3d!(pos, model, hovered, info, infocolor, v2r)
+function plot_main!(pos, model, hovered, info, infocolor;
+                    show_title::Bool = true, show_axis_labels::Bool = false)
+    model.ndims == 1 && return plot_1d!(pos, model, hovered, info, infocolor;
+                                        show_title, show_axis_labels)
+    model.ndims == 2 && return plot_2d!(pos, model, hovered, info, infocolor;
+                                        show_title, show_axis_labels)
+    return plot_3d!(pos, model, hovered, info, infocolor)
 end
 
 # --- custom legend (with hover highlight) -----------------------------------
 
 """Number of (columns, rows) for `n` legend entries, capping rows so a
-many-method function (e.g. `+`) wraps into columns instead of a tall list."""
+many-method function wraps into columns instead of a tall list."""
 function legend_layout(n::Int)
-    maxrows = 14
+    maxrows = 8
     ncols = max(1, cld(n, maxrows))
     return ncols, cld(n, ncols)
 end
 
-function make_legend!(pos, model, rows, hovered, infocolor)
+function make_legend!(pos, model, rows, hovered, infocolor, v2r)
     n = length(rows)
     ncols, nrows = legend_layout(n)
     colw = 1 / ncols
@@ -536,16 +600,21 @@ function make_legend!(pos, model, rows, hovered, infocolor)
     Makie.hidedecorations!(ax); Makie.hidespines!(ax)
 
     entrypos(idx) = ((idx - 1) ÷ nrows * colw, Float64(nrows - (idx - 1) % nrows))
+    # Inverse of v2r: legend row → grid value, used to push hovers from the
+    # legend back into `hovered` (which other components read).
+    r2v = Dict{Int,Int}(r => v for (v, r) in v2r)
 
+    # `hovered` is the *grid value* currently in focus; translate it to a
+    # legend-row index via v2r so the bar highlight lands on the right row.
     hl = Makie.lift(hovered) do h
-        if 1 <= h <= n
-            x0, y = entrypos(h)
+        rowidx = get(v2r, h, 0)
+        if 1 <= rowidx <= n
+            x0, y = entrypos(rowidx)
             Makie.Rect2f(x0, y - 0.45, colw, 0.9)
         else
             Makie.Rect2f(-9.0, -9.0, 1.0e-3, 1.0e-3)
         end
     end
-    # Highlight the hovered entry in the hovered tile's own colour.
     fillc = Makie.lift(c -> Makie.RGBAf(c.r, c.g, c.b, 0.35 * c.alpha), infocolor)
     Makie.poly!(ax, hl; color = fillc, strokecolor = infocolor, strokewidth = 2)
 
@@ -556,5 +625,22 @@ function make_legend!(pos, model, rows, hovered, infocolor)
         Makie.text!(ax, x0 + 0.03, y; text = label, align = (:left, :center), fontsize = 11)
     end
     Makie.xlims!(ax, 0, 1); Makie.ylims!(ax, 0.4, nrows + 0.6)
+
+    # Hovering a legend row updates `hovered` with that row's grid value,
+    # which drives the bidirectional highlight on the grid cells.
+    Makie.on(Makie.events(ax.scene).mouseposition) do _
+        Makie.is_mouseinside(ax.scene) || return
+        p = Makie.mouseposition(ax.scene)
+        col_i = clamp(floor(Int, p[1] / colw), 0, ncols - 1)
+        # y is in [0.4, nrows+0.6]; row 1 sits at y=nrows, row 2 at y=nrows-1, ...
+        rowy = nrows - round(Int, p[2]) + 1
+        idx = col_i * nrows + rowy
+        if 1 <= idx <= n
+            v = get(r2v, idx, 0)
+            v == 0 && return                # status rows w/o grid mapping
+            hovered[] = v
+            infocolor[] = color_for(model, v)
+        end
+    end
     return ax
 end
