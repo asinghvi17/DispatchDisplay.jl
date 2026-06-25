@@ -1,6 +1,6 @@
 using DispatchDisplay
 using DispatchDisplay: build_model, cell_owner, arity, infer_ndims,
-    order_types, axis_brackets, type_chain, arg_types, method_source,
+    order_types, build_axis_tree, type_chain, arg_types, method_source,
     legend_rows, describe_cell
 using CairoMakie  # headless backend for rendering tests
 using LinearAlgebra: Adjoint, Transpose
@@ -50,16 +50,32 @@ end
     @test inum == collect(minimum(inum):maximum(inum))
 end
 
-@testset "axis brackets span subtypes" begin
-    axisvec = order_types(Any[Int, Float64, String])
-    brs = axis_brackets(foo, axisvec, 1, 2)   # foo has a ::Number method
-    numbr = filter(b -> b.label == "Number", brs)
-    @test length(numbr) == 1
-    b = only(numbr)
-    # The Number bracket must span exactly the numeric axis entries (contiguous).
-    nums = findall(T -> T <: Number, axisvec)
-    @test b.lo == minimum(nums) && b.hi == maximum(nums)
-    @test b.hi > b.lo                          # spans both Int and Float64
+@testset "axis tree DAG" begin
+    # Number is parented above Int and Float64 via the supertype walk;
+    # String is its own root. Tree nodes are indexed independently of axis.
+    treevec = order_types(Any[Int, Float64, String, Number])
+    has_method = trues(length(treevec))
+    lookup = T -> findfirst(==(T), treevec)
+    t = build_axis_tree(treevec, has_method, lookup)
+    numidx = findfirst(==(Number), t.nodes)
+    intidx = findfirst(==(Int), t.nodes)
+    flidx  = findfirst(==(Float64), t.nodes)
+    strix  = findfirst(==(String), t.nodes)
+    @test numidx in t.parents[intidx]
+    @test numidx in t.parents[flidx]
+    @test isempty(t.parents[strix])             # String is a root
+    @test isempty(t.parents[numidx])            # Number is a root
+    @test sort(t.children[numidx]) == sort([intidx, flidx])
+
+    # Overlap: Int parented by Number AND by Union{Int,String} (both tree
+    # nodes, neither contained in the other) → DAG with two edges into Int.
+    treevec2 = order_types(Any[Int, Number, Union{Int,String}])
+    has2 = trues(length(treevec2))
+    t2 = build_axis_tree(treevec2, has2, T -> findfirst(==(T), treevec2))
+    numidx2 = findfirst(==(Number), t2.nodes)
+    uidx2   = findfirst(==(Union{Int,String}), t2.nodes)
+    intidx2 = findfirst(==(Int), t2.nodes)
+    @test sort(t2.parents[intidx2]) == sort([numidx2, uidx2])
 end
 
 @testset "model grid (explicit types only on axes)" begin
@@ -69,7 +85,20 @@ end
     @test size(m.grid) == (3, 3)
     @test 0 in m.grid          # the uncovered String,Int corner exists
     @test maximum(m.grid) == length(m.methodlist)
-    @test any(b -> b.label == "Number", m.brackets[1])    # subtyping via brackets
+    # Provided axes still get tree enrichment: `Number` (and `Real`) show up
+    # as floating tree nodes between the concretes. The intermediate chain
+    # gives the user the full Number > Real > Int hierarchy.
+    @test Number in m.trees[1].nodes
+    @test Real in m.trees[1].nodes
+    numt = findfirst(==(Number), m.trees[1].nodes)
+    realt = findfirst(==(Real), m.trees[1].nodes)
+    intt = findfirst(==(Int), m.trees[1].nodes)
+    flot = findfirst(==(Float64), m.trees[1].nodes)
+    @test realt in m.trees[1].parents[intt]           # Real is Int's parent
+    @test realt in m.trees[1].parents[flot]           # ... and Float64's
+    @test numt  in m.trees[1].parents[realt]          # Number sits above Real
+    @test m.trees[1].axis_idx[numt] === nothing       # tree-only (no grid cell)
+    @test m.trees[1].axis_idx[realt] === nothing
 end
 
 @testset "stable colours when methods are added" begin
@@ -105,7 +134,7 @@ end
     m = build_model(play, types)
     @test size(m.grid) == (2, 2)
     @test all(>(0), m.grid)                 # tie + commutativity fallback cover all
-    @test isempty(m.brackets[1])            # no noisy Type{<:Shape} bracket
+    @test all(isempty, m.trees[1].children) # no noisy Type{<:Shape} tree edges
     @test DispatchDisplay.typelabel(Type{Rock}) == "Rock"
 end
 
@@ -113,51 +142,51 @@ end
     @test all(T -> T isa Type && isconcretetype(T), numeric_types())
     @test all(T -> T isa Type && isconcretetype(T), matrix_types())
 
-    # Inferred arity mode, default: axes hold both the concrete types appearing
-    # in signatures AND the abstract types that own methods. `Number` shows up
-    # both as an axis cell and as the bracket spanning Number-subtype cells.
+    # Inferred arity mode: axes hold the *concrete* types from signatures
+    # (`Int`); abstract types with concrete coverage on the axis (`Number`
+    # here, covered by `Int`) move into the tree as floating nodes.
     h(x::Int, y::Int) = 1
     h(x::Number, y::Number) = 2
     m = build_model(h, nothing; arity = 2)
     @test m.ndims == 2
-    @test Number in m.axes[1]
     @test Int in m.axes[1]
-    @test any(b -> b.label == "Number", m.brackets[1])
-    # The Number bracket should include the Number axis cell itself.
-    numbr = only(b for b in m.brackets[1] if b.label == "Number")
-    @test m.axes[1][numbr.lo] === Number || m.axes[1][numbr.hi] === Number
+    @test !(Number in m.axes[1])               # Number is tree-only (covered by Int)
+    @test Number in m.trees[1].nodes           # ...but it IS a tree node
+    intidx_t = findfirst(==(Int), m.trees[1].nodes)
+    numidx_t = findfirst(==(Number), m.trees[1].nodes)
+    @test numidx_t in m.trees[1].parents[intidx_t]   # parent edge in the tree
 
-    # `show_abstracts=false` restores the old concrete-only behaviour.
+    # `show_abstracts=false` strips abstracts from both axis and tree.
     mc = build_model(h, nothing; arity = 2, show_abstracts = false)
     @test all(isconcretetype, mc.axes[1])
     @test !(Number in mc.axes[1])
-    @test any(b -> b.label == "Number", mc.brackets[1])
+    @test !(Number in mc.trees[1].nodes)
 
-    # `show_any` toggle: by default the catch-all `Any` cell is included when
-    # a method uses it; opt out with `show_any=false`.
+    # `show_any` toggle: by default `Any` participates as a tree root when it
+    # appears in a signature (covered by concrete descendants here, so it's
+    # tree-only, not on the axis). Opt out with `show_any=false`.
     hany(x::Any) = 1
     hany(x::Int) = 2
-    @test  (Any in build_model(hany, nothing; arity = 1).axes[1])
-    @test !(Any in build_model(hany, nothing; arity = 1, show_any = false).axes[1])
+    @test  (Any in build_model(hany, nothing; arity = 1).trees[1].nodes)
+    @test !(Any in build_model(hany, nothing; arity = 1, show_any = false).trees[1].nodes)
 
-    # Unions in signatures: constituents are always expanded onto the axis,
-    # and by default the Union itself is also included as its own axis cell.
-    # Parametric Unions (`UnionAll` wrapping a Union) used to crash chainkey
-    # via `supertype(::Type{Union{...}})` — make sure they don't anymore.
+    # Unions in signatures: members are enumerated onto the axis. The Union
+    # itself becomes a tree-only node when its members are covered.
     huni(x::Union{Float32,Float64}) = 1
-    @test  (Float32 in build_model(huni, nothing; arity = 1).axes[1])
-    @test  (Float64 in build_model(huni, nothing; arity = 1).axes[1])
-    @test  (Union{Float32,Float64} in build_model(huni, nothing; arity = 1).axes[1])
-    # Opt out with `show_unions=false`: only the constituents remain.
-    @test !(Union{Float32,Float64} in
-            build_model(huni, nothing; arity = 1, show_unions = false).axes[1])
+    m1 = build_model(huni, nothing; arity = 1)
+    @test  (Float32 in m1.axes[1])
+    @test  (Float64 in m1.axes[1])
+    @test !(Union{Float32,Float64} in m1.axes[1])         # tree-only, covered
+    @test   Union{Float32,Float64} in m1.trees[1].nodes
+    # The Union is a parent of each member in the tree.
+    ui_t = findfirst(==(Union{Float32,Float64}), m1.trees[1].nodes)
+    fi_t = findfirst(==(Float32), m1.trees[1].nodes)
+    @test ui_t in m1.trees[1].parents[fi_t]
 
     # The crashy case: `Union{...} where {T,V<:AbstractVector}` — must just work.
     hpar(x::Union{Adjoint{T,V},Transpose{T,V}}) where {T,V<:AbstractVector} = 1
     hpar(x::Vector) = 2
     @test build_model(hpar, nothing; arity = 1) isa DispatchDisplay.DispatchModel
-    @test build_model(hpar, nothing; arity = 1, show_unions = true) isa
-          DispatchDisplay.DispatchModel
 
     # Level-of-detail ticks: hidden when too many are visible, listed otherwise.
     names = string.(1:40)

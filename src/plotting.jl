@@ -120,29 +120,219 @@ function legend_rows(model::DispatchModel)
     return rows, v2r, inline
 end
 
-# --- brackets (top for arg₁, right for arg₂; opposite the tick labels) -------
+# --- DAG rendering on a linked sibling axis -----------------------------------
+#
+# Each grid axis-dimension gets its own `tree_axis_*!` Axis that shares its data
+# coordinate with the main grid via `linkxaxes!`/`linkyaxes!`. The DAG is drawn
+# as squared `linesegments!` connectors on this sibling axis, with `text!`
+# labels (gray for abstracts/Unions) at each node. Parent rests at depth
+# `tree_depth - depth[p] + 1`, so shallow parents (close to the root) sit
+# furthest from the grid, hugging the outside.
 
-bracket_depth(brs) = isempty(brs) ? 0 : maximum(b.depth for b in brs) + 1
+const TREE_COLOR = Makie.RGBAf(0.45, 0.45, 0.45, 1.0)
+const TREE_LINEWIDTH = 1.2
+const LABEL_CONCRETE       = Makie.RGBAf(0.10, 0.10, 0.10, 1.0)   # concrete + has method
+const LABEL_NONCONCRETE    = Makie.RGBAf(0.35, 0.35, 0.35, 1.0)   # abstract/Union + has method
+const LABEL_INTERMEDIATE   = Makie.RGBAf(0.55, 0.55, 0.55, 1.0)   # no own method (pure intermediate)
+const TREE_NAME_MAXLEN = 22          # label truncation length per node
 
-function draw_brackets_x!(ax, brs, y0, step)
-    for b in brs
-        y = y0 + b.depth * step
-        Makie.bracket!(ax, b.lo - 0.45, y, b.hi + 0.45, y;
-            offset = 1, text = b.label, orientation = :up,
-            fontsize = 11, textcolor = :gray25, color = :gray45)
-    end
+"""Tree axis depth (the deepest path length), used to size the sibling axis."""
+tree_height(t::AxisTree) = tree_depth(t) + 1
+
+"""Label colour tier — concrete-with-method darkest, intermediate lightest."""
+function _label_color(@nospecialize(T), has_method::Bool)
+    has_method || return LABEL_INTERMEDIATE
+    is_abstract_axis(T) ? LABEL_NONCONCRETE : LABEL_CONCRETE
 end
 
-function draw_brackets_y!(ax, brs, x0, step)
-    for b in brs
-        # `:up` with a bottom→top span makes the brace embrace the grid from the
-        # left (opening toward the tiles, label on the outside), mirroring the
-        # top brackets which embrace from above.
-        x = x0 - b.depth * step
-        Makie.bracket!(ax, x, b.lo - 0.45, x, b.hi + 0.45;
-            offset = 1, text = b.label, orientation = :up, rotation = pi / 2,
-            fontsize = 11, textcolor = :gray25, color = :gray45)
+"""
+    _tree_node_positions(tree, axis_count) -> Vector{Float64}
+
+Position each tree node along its axis dimension:
+* axis leaves sit at their `axis_idx` (integer).
+* floating nodes sit at the centroid of their *axis-leaf* descendants, with a
+  small offset when the centroid coincides exactly with an axis leaf's
+  position (otherwise the floating node's label would sit on top of the leaf
+  label — common for `Mammal → Dog`-style chains where the floating node has
+  one axis-leaf descendant).
+* Nodes without any axis-leaf descendant fall back to centroid of all
+  descendants, then to the midpoint of the axis.
+"""
+function _tree_node_positions(tree::AxisTree, axis_count::Int)
+    n = length(tree.nodes)
+    pos = fill(NaN, n)
+    for k in 1:n
+        ai = tree.axis_idx[k]
+        ai === nothing || (pos[k] = float(ai))
     end
+    function leaf_descendants(k)
+        seen = Set{Int}()
+        q = Int[k]
+        while !isempty(q)
+            j = popfirst!(q)
+            for c in tree.children[j]
+                c in seen && continue
+                push!(seen, c)
+                push!(q, c)
+            end
+        end
+        return seen
+    end
+    # Track leaf-axis indices that already have a floating node directly on
+    # them, so chained floating nodes (e.g. Number → Real → Float64) get
+    # progressively larger offsets and stack visibly instead of all colliding.
+    nudge_count = Dict{Int,Int}()
+    for k in 1:n
+        isnan(pos[k]) || continue
+        ds = leaf_descendants(k)
+        leaves = [tree.axis_idx[d] for d in ds if tree.axis_idx[d] !== nothing]
+        if length(leaves) == 1
+            li = leaves[1]
+            offset = 0.35 + 0.18 * get(nudge_count, li, 0)
+            pos[k] = li - offset
+            nudge_count[li] = get(nudge_count, li, 0) + 1
+        elseif !isempty(leaves)
+            pos[k] = sum(leaves) / length(leaves)
+        elseif !isempty(ds)
+            pos[k] = sum(d for d in ds) / length(ds)
+        else
+            pos[k] = (1 + axis_count) / 2
+        end
+    end
+    return pos
+end
+
+_push_seg!(segs, x1, y1, x2, y2, swap::Bool) = swap ?
+    (push!(segs, Makie.Point2f(y1, x1), Makie.Point2f(y2, x2))) :
+    (push!(segs, Makie.Point2f(x1, y1), Makie.Point2f(x2, y2)))
+
+# Reserved data-unit "label band" above each x-tree node: drops stop at the
+# top of this band so the connector points down to the label without slicing
+# through it. Sized to comfortably clear the default ~14px label height with
+# the per-depth pixel sizing used in `_render!`.
+const LABEL_BAND = 0.35
+
+"""DAG edge segments — squared connectors from parent's `(pos, depth)` over a
+cross-bar at `depth - 0.5` down toward each child. Drops stop above the
+child's `LABEL_BAND` so the connector visually points to the label without
+running through it."""
+function _tree_edge_segments(tree::AxisTree, node_pos::Vector{Float64}; swap::Bool)
+    D = tree_depth(tree)
+    segs = Makie.Point2f[]
+    for p in 1:length(tree.children)
+        ch = tree.children[p]
+        isempty(ch) && continue
+        depth_p = float(D - tree.depth[p] + 1)
+        cb = depth_p - 0.5
+        xp = node_pos[p]
+        _push_seg!(segs, xp, depth_p, xp, cb, swap)
+        xmin = float(min(xp, minimum(node_pos[c] for c in ch)))
+        xmax = float(max(xp, maximum(node_pos[c] for c in ch)))
+        _push_seg!(segs, xmin, cb, xmax, cb, swap)
+        for c in ch
+            drop_end = float(D - tree.depth[c] + 1) + LABEL_BAND
+            # Don't draw a degenerate-or-inverted drop when the cross-bar
+            # already sits inside the label band (deep trees, tight spacing).
+            drop_end < cb || continue
+            _push_seg!(segs, node_pos[c], cb, node_pos[c], drop_end, swap)
+        end
+    end
+    return segs
+end
+
+"""Create a sibling x-tree `Axis` above `main`, sharing its x-coordinate.
+
+Tree depth runs upward (root at the top, leaves just above the grid). Labels
+sit above their nodes — no rotation, since each label has a full row of its
+own and the depth-spacing keeps them from stacking vertically.
+"""
+function tree_axis_top!(pos, tree::AxisTree, axis_count::Int, main::Makie.Axis)
+    D = tree_depth(tree)
+    ax = Makie.Axis(pos;
+        xticks = (Float64[], String[]), xticklabelsvisible = false,
+        xticksvisible = false, xgridvisible = false,
+        yticks = (Float64[], String[]), yticklabelsvisible = false,
+        yticksvisible = false, ygridvisible = false)
+    Makie.hidespines!(ax)
+    Makie.linkxaxes!(main, ax)
+    node_pos = _tree_node_positions(tree, axis_count)
+    segs = _tree_edge_segments(tree, node_pos; swap = false)
+    isempty(segs) ||
+        Makie.linesegments!(ax, segs; color = TREE_COLOR, linewidth = TREE_LINEWIDTH)
+    for k in 1:length(tree.nodes)
+        T = tree.nodes[k]
+        T isa Type || continue
+        y = float(D - tree.depth[k] + 1)
+        Makie.text!(ax, node_pos[k], y;
+            text = _shorten(typelabel(T); maxlen = TREE_NAME_MAXLEN),
+            color = _label_color(T, tree.has_method[k]),
+            align = (:center, :bottom), fontsize = 11,
+            offset = (0.0f0, 4.0f0))   # small gap from the connector line
+    end
+    Makie.ylims!(ax, 0.5, D + 1.8)
+    return ax
+end
+
+"""Create a sibling y-tree `Axis` to the left of `main`, sharing its y.
+
+Depth uses *negative* x coordinates so the root naturally sits leftmost
+(furthest from the grid) without flipping the axis. Labels are right-aligned
+with a small pixel gap so they don't run into the connector line.
+"""
+function tree_axis_left!(pos, tree::AxisTree, axis_count::Int, main::Makie.Axis)
+    D = tree_depth(tree)
+    ax = Makie.Axis(pos;
+        yticks = (Float64[], String[]), yticklabelsvisible = false,
+        yticksvisible = false, ygridvisible = false,
+        xticks = (Float64[], String[]), xticklabelsvisible = false,
+        xticksvisible = false, xgridvisible = false)
+    Makie.hidespines!(ax)
+    Makie.linkyaxes!(main, ax)
+    node_pos = _tree_node_positions(tree, axis_count)
+    # Flip depths into negative x so the root (depth 0) is leftmost and leaves
+    # sit just to the left of the grid. The edge-segment helper consumes the
+    # same "tree depth coord" used for label placement, so we flip there too.
+    segs = Makie.Point2f[]
+    for p in 1:length(tree.children)
+        ch = tree.children[p]
+        isempty(ch) && continue
+        xp = -float(D - tree.depth[p] + 1)
+        cb = xp + 0.5
+        push!(segs, Makie.Point2f(xp, node_pos[p]), Makie.Point2f(cb, node_pos[p]))
+        ymin = float(min(node_pos[p], minimum(node_pos[c] for c in ch)))
+        ymax = float(max(node_pos[p], maximum(node_pos[c] for c in ch)))
+        push!(segs, Makie.Point2f(cb, ymin), Makie.Point2f(cb, ymax))
+        for c in ch
+            xc = -float(D - tree.depth[c] + 1)
+            push!(segs, Makie.Point2f(cb, node_pos[c]), Makie.Point2f(xc, node_pos[c]))
+        end
+    end
+    isempty(segs) ||
+        Makie.linesegments!(ax, segs; color = TREE_COLOR, linewidth = TREE_LINEWIDTH)
+    for k in 1:length(tree.nodes)
+        T = tree.nodes[k]
+        T isa Type || continue
+        x = -float(D - tree.depth[k] + 1)
+        # Label baseline sits a few px above the stalk so the horizontal
+        # connector at y=node_pos doesn't slice through the text.
+        Makie.text!(ax, x, node_pos[k];
+            text = _shorten(typelabel(T); maxlen = TREE_NAME_MAXLEN),
+            color = _label_color(T, tree.has_method[k]),
+            align = (:right, :bottom), fontsize = 11,
+            offset = (-4.0f0, 3.0f0))
+    end
+    # Left pad enough for the widest *root-level* label (those extend furthest
+    # left). Char-to-data-unit is a heuristic; the figure colsize compensates.
+    max_root_chars = 0
+    for k in 1:length(tree.nodes)
+        T = tree.nodes[k]
+        T isa Type || continue
+        tree.depth[k] == 0 || continue
+        max_root_chars = max(max_root_chars,
+            length(_shorten(typelabel(T); maxlen = TREE_NAME_MAXLEN)))
+    end
+    Makie.xlims!(ax, -(D + 1 + 0.4 * max_root_chars), -0.3)
+    return ax
 end
 
 const MAXLABELS = 30   # hide tick labels above this many visible cells (zoom to reveal)
@@ -183,11 +373,8 @@ end
 # --- per-dimension plots ----------------------------------------------------
 
 function plot_1d!(pos, model, hovered, info, infocolor, v2r)
+    n = length(model.axes[1])
     names = typelabel.(model.axes[1])
-    n = length(names)
-    bx = model.brackets[1]
-    step = 0.4
-    my = bracket_depth(bx) * step + (isempty(bx) ? 0.0 : 0.25)
     ax = Makie.Axis(pos;
         title = "$(funcname(model.f))(arg₁)",
         xticks = (1:n, names), xticklabelrotation = pi / 4,
@@ -203,8 +390,7 @@ function plot_1d!(pos, model, hovered, info, infocolor, v2r)
     end
     Makie.image!(ax, (0.5, n + 0.5), (0.5, 1.5), cols; interpolate = false)
     cell_borders!(ax, n, 1)
-    draw_brackets_x!(ax, bx, 1.55, step)
-    Makie.limits!(ax, 0.5, n + 0.5, 0.5, 1.5 + my)
+    Makie.limits!(ax, 0.5, n + 0.5, 0.5, 1.5)
     Makie.on(Makie.events(ax.scene).mouseposition) do _
         if Makie.is_mouseinside(ax.scene)
             p = Makie.mouseposition(ax.scene)
@@ -223,24 +409,13 @@ function plot_1d!(pos, model, hovered, info, infocolor, v2r)
 end
 
 function plot_2d!(pos, model, hovered, info, infocolor, v2r)
-    n1 = typelabel.(model.axes[1]); n2 = typelabel.(model.axes[2])
-    nx, ny = length(n1), length(n2)
-    bx, by = model.brackets[1], model.brackets[2]
-    step = 0.4
-    # Big grids (e.g. a whole operator) become a zoomable "dispatch map": no
-    # brackets/borders, and labels appear only as you zoom in (level-of-detail).
+    nx, ny = length(model.axes[1]), length(model.axes[2])
+    namesX = typelabel.(model.axes[1])
+    namesY = typelabel.(model.axes[2])
     big = nx * ny > 600
-    # The extra room (beyond the bracket stack) holds the outermost bracket's
-    # label; scale it a little with the grid size so the label isn't clipped on
-    # denser grids (where a data unit maps to fewer pixels).
-    pad = 0.45 + 0.04 * max(nx, ny)
-    my = (big || isempty(bx)) ? 0.0 : bracket_depth(bx) * step + pad   # top room
-    mx = (big || isempty(by)) ? 0.0 : bracket_depth(by) * step + pad   # left room
-    # Square cells (DataAspect); the frame is hidden so the letterbox whitespace
-    # doesn't read as a gap, and the brackets sit in slim top/left margins.
     ax = Makie.Axis(pos;
         title = "$(funcname(model.f))(arg₁, arg₂)", xlabel = "arg₁", ylabel = "arg₂",
-        xticks = (1:nx, n1), yticks = (1:ny, n2),
+        xticks = (1:nx, namesX), yticks = (1:ny, namesY),
         xticklabelrotation = pi / 4, xgridvisible = false, ygridvisible = false,
         aspect = Makie.DataAspect())
     Makie.hidespines!(ax)
@@ -252,13 +427,9 @@ function plot_2d!(pos, model, hovered, info, infocolor, v2r)
         cols[i, j] = (abs1[i] || abs2[j]) ? fade(c) : c
     end
     Makie.image!(ax, (0.5, nx + 0.5), (0.5, ny + 0.5), cols; interpolate = false)
-    if !big
-        cell_borders!(ax, nx, ny)
-        draw_brackets_x!(ax, bx, ny + 0.55, step)
-        draw_brackets_y!(ax, by, 0.45, step)
-    end
-    Makie.limits!(ax, 0.5 - mx, nx + 0.5, 0.5, ny + 0.5 + my)
-    (nx > MAXLABELS || ny > MAXLABELS) && lod_ticks!(ax, n1, n2)
+    big || cell_borders!(ax, nx, ny)
+    Makie.limits!(ax, 0.5, nx + 0.5, 0.5, ny + 0.5)
+    (nx > MAXLABELS || ny > MAXLABELS) && lod_ticks!(ax, namesX, namesY)
     Makie.on(Makie.events(ax.scene).mouseposition) do _
         if Makie.is_mouseinside(ax.scene)
             p = Makie.mouseposition(ax.scene)
@@ -304,7 +475,20 @@ function plot_3d!(pos, model, hovered, info, infocolor, v2r)
         title = "$(funcname(model.f))(arg₁, arg₂, arg₃)",
         xlabel = "arg₁", ylabel = "arg₂", zlabel = "arg₃",
         xticks = (pitch .* (1:nx), namesX), yticks = (1:ny, namesY),
-        zticks = (1:nz, namesZ), aspect = :data)
+        zticks = (1:nz, namesZ), aspect = :data,
+        # `:fitzoom` (Axis3's default) lets scroll move the camera inside the
+        # data box, which makes the axis frame appear to cut through the cubes.
+        # `:fit` keeps the data framed at all times; rotation still works and
+        # hovering is the primary drill-in interaction anyway.
+        viewmode = :fit,
+        # Give tick labels room to live outside the box.
+        protrusions = 60)
+    # Pad the limits so the outermost cubes don't sit flush against the axis
+    # frame (the cube extends ±thick/2 in x and ±0.5 in y/z from each centre).
+    Makie.limits!(ax,
+        (0.5 * pitch, (nx + 0.5) * pitch),
+        (0.3, ny + 0.7),
+        (0.3, nz + 0.7))
     if !isempty(pts)
         mp = Makie.meshscatter!(ax, pts;
             marker = Makie.Rect3f(Makie.Vec3f(-0.5), Makie.Vec3f(1)),

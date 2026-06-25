@@ -87,25 +87,59 @@ function _render!(d::DispatchDisplayResult)
     showpanel = nmethods > 0 && (manymethods || !inline)
     showlegend = !isempty(rows) && !manymethods
 
-    # Vertically stacked (split-screen friendly): grid → [hover panel] → [legend]
-    # → refresh button.
+    # Top region: grid + linked sibling axes that draw the per-dimension DAG.
+    # Everything lives directly in `fig.layout` (no nested GridLayouts — they
+    # confuse `_clear!` + Fixed-row reset across refresh cycles). 1D = top
+    # tree row + main row. 2D = 2×2 (corner blank / x-tree, y-tree / main).
+    # 3D = main only for now; linked Axis3 trees come in a follow-up.
     r = 1
-    plot_main!(fig[r, 1], model, hovered, info, infocolor, v2r); r += 1
+    if model.ndims == 1
+        tree1 = model.trees[1]
+        if any(tree1.expandable)
+            ax_main = plot_main!(fig[2, 1], model, hovered, info, infocolor, v2r)
+            tree_axis_top!(fig[1, 1], tree1, length(model.axes[1]), ax_main)
+            Makie.rowsize!(fig.layout, 1, Makie.Fixed(tree_height(tree1) * 56.0 + 40.0))
+            r = 2
+        else
+            plot_main!(fig[1, 1], model, hovered, info, infocolor, v2r)
+        end
+    elseif model.ndims == 2
+        tx, ty = model.trees[1], model.trees[2]
+        showtx, showty = any(tx.expandable), any(ty.expandable)
+        main_row, main_col = showtx ? 2 : 1, showty ? 2 : 1
+        ax_main = plot_main!(fig[main_row, main_col], model, hovered, info, infocolor, v2r)
+        if showtx
+            tree_axis_top!(fig[1, main_col], tx, length(model.axes[1]), ax_main)
+            Makie.rowsize!(fig.layout, 1, Makie.Fixed(tree_height(tx) * 56.0 + 40.0))
+        end
+        if showty
+            tree_axis_left!(fig[main_row, 1], ty, length(model.axes[2]), ax_main)
+            Makie.colsize!(fig.layout, 1, Makie.Fixed(tree_height(ty) * 36.0 + 110.0))
+        end
+        r = main_row + 1
+    else  # 3D — main only for now
+        plot_main!(fig[1, 1], model, hovered, info, infocolor, v2r)
+        r = 2
+    end
+    # Below-grid stuff spans both columns (so the hover panel/legend cover the
+    # full width when a y-tree column is present).
+
+    span = model.ndims == 2 && any(model.trees[2].expandable) ? (1:2) : (1:1)
     if showpanel
         # A tinted box behind the text, coloured by the hovered tile's method.
         boxc = Makie.lift(c -> Makie.RGBAf(c.r, c.g, c.b, 0.18 * c.alpha), infocolor)
-        Makie.Box(fig[r, 1]; color = boxc, strokecolor = infocolor, strokewidth = 2)
-        Makie.Label(fig[r, 1], info; halign = :left, justification = :left,
+        Makie.Box(fig[r, span]; color = boxc, strokecolor = infocolor, strokewidth = 2)
+        Makie.Label(fig[r, span], info; halign = :left, justification = :left,
             fontsize = 12, tellheight = false, tellwidth = false,
             padding = (10, 10, 6, 6))
         Makie.rowsize!(fig.layout, r, Makie.Fixed(96.0)); r += 1
     end
     if showlegend
-        make_legend!(fig[r, 1], model, rows, hovered, infocolor)
+        make_legend!(fig[r, span], model, rows, hovered, infocolor)
         Makie.rowsize!(fig.layout, r, Makie.Fixed(legend_layout(length(rows))[2] * 24 + 30.0))
         r += 1
     end
-    btn = Makie.Button(fig[r, 1]; label = "⟳ Refresh", tellwidth = false)
+    btn = Makie.Button(fig[r, span]; label = "⟳ Refresh", tellwidth = false)
     Makie.rowsize!(fig.layout, r, Makie.Fixed(34.0))
     Makie.on(btn.clicks) do _
         refresh!(d)

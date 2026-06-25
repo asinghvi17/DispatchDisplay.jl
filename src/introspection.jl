@@ -65,28 +65,23 @@ function infer_ndims(f)
 end
 
 """
-    infer_axes(f, ndims; include_unions=false) -> Vector{Vector{Any}}
+    infer_axes(f, ndims) -> Vector{Vector{Any}}
 
-Collect, per argument position, every type literally mentioned in the
-signatures of `f`'s `ndims`-argument methods. Unions are always expanded into
-their constituents; with `include_unions`, the Union itself is also added as
-an axis entry (so a single faded cell can stand in for the whole Union).
+Collect, per argument position, the types literally mentioned as a whole arg
+type in `f`'s `ndims`-argument methods. A `Union` signature contributes the
+Union itself (not its constituents) — a constituent only earns its own axis
+entry when some other method specialises on it directly. This is how the DAG
+later expresses "covered via the Union" without duplicating cells for
+constituents that have no more-specific method.
 """
-function infer_axes(f, ndims::Int; include_unions::Bool = false)
+function infer_axes(f, ndims::Int)
     axes = [Any[] for _ in 1:ndims]
     for m in methods(f)
         isvararg(m) && continue
         ats = arg_types(m)
         length(ats) == ndims || continue
         for i in 1:ndims
-            t = ats[i]
-            for p in expand_union(t)
-                push!(axes[i], p)
-            end
-            if include_unions
-                body = t isa UnionAll ? Base.unwrap_unionall(t) : t
-                body isa Union && push!(axes[i], t)
-            end
+            push!(axes[i], ats[i])
         end
     end
     return axes
