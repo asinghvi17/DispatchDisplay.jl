@@ -83,17 +83,33 @@ function enrich_with_ancestors(types)
             s = sup
         end
     end
+    # For each candidate, compute its descendant set over `types`. Then drop
+    # candidates that are *redundant* — covered by a strictly-more-specific
+    # candidate with the same descendant set (e.g. `Number` ⊋ `Real` when
+    # axis has only `Int`+`Float64`, both ancestors span the same descendants
+    # so we keep only `Real`). Also drop singletons (need ≥2 descendants).
+    desc_of = Dict{Any,Set{Any}}()
+    for A in candidates
+        ds = Set{Any}()
+        for T in types
+            T isa Type && T !== A && _safe_subtype(T, A) && push!(ds, T)
+        end
+        desc_of[A] = ds
+    end
     extras = Any[]
     for A in candidates
-        # Count strict subtypes already on axis (transitive over the original
-        # `types` set — ancestors collected above aren't counted as descendants
-        # of themselves).
-        n = 0
-        for T in types
-            T isa Type && T !== A && _safe_subtype(T, A) && (n += 1)
-            n >= 2 && break
+        ds_A = desc_of[A]
+        length(ds_A) >= 2 || continue
+        redundant = false
+        for U in candidates
+            U === A && continue
+            _safe_subtype(U, A) || continue                # U ⊆ A
+            if get(desc_of, U, Set{Any}()) == ds_A         # same descendants
+                redundant = true
+                break
+            end
         end
-        n >= 2 && push!(extras, A)
+        redundant || push!(extras, A)
     end
     return vcat(collect(types), extras)
 end

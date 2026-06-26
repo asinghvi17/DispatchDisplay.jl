@@ -134,7 +134,8 @@ const TREE_LINEWIDTH = 1.2
 const LABEL_CONCRETE       = Makie.RGBAf(0.10, 0.10, 0.10, 1.0)   # concrete + has method
 const LABEL_NONCONCRETE    = Makie.RGBAf(0.35, 0.35, 0.35, 1.0)   # abstract/Union + has method
 const LABEL_INTERMEDIATE   = Makie.RGBAf(0.55, 0.55, 0.55, 1.0)   # no own method (pure intermediate)
-const TREE_NAME_MAXLEN = 22          # label truncation length per node
+const TREE_NAME_MAXLEN = 22          # leaf label truncation length
+const TREE_INTERNAL_MAXLEN = 12      # internal-node label truncation length
 
 """Tree axis depth (the deepest path length), used to size the sibling axis."""
 tree_height(t::AxisTree) = tree_depth(t) + 1
@@ -208,10 +209,11 @@ end
 # in `_render!`.
 const LABEL_BAND = 0.35
 
-"""Straight-line DAG edge segments for the x-tree (depth runs on y, axis
-position on x). Each parent→child pair produces one line, ending above the
-child's label band so the connector visually points at the label without
-crossing it. Multi-parent children naturally get one slanted line per parent."""
+"""DAG edge segments for the x-tree. Internal-to-internal edges are straight
+diagonals. Leaf edges go diagonally from the parent down to the leaf node
+position (where the label starts). The label itself — vertical, hanging
+below the leaf — visually completes the path as its final perpendicular
+segment, so no extra stroke is drawn behind it."""
 function _tree_edges_x(tree::AxisTree, node_pos::Vector{Float64})
     D = tree_depth(tree)
     segs = Makie.Point2f[]
@@ -222,17 +224,22 @@ function _tree_edges_x(tree::AxisTree, node_pos::Vector{Float64})
         y_p = float(D - tree.depth[p] + 1)
         for c in ch
             x_c = node_pos[c]
-            y_c = float(D - tree.depth[c] + 1) + LABEL_BAND
-            y_c < y_p || continue        # degenerate / inverted: skip
+            # Endpoint = leaf node y for leaves (label takes over from here),
+            # or a small label-band offset for internal nodes (label sits
+            # above their node so the edge endpoint hits the label top).
+            y_c = tree.axis_idx[c] !== nothing ?
+                  float(D - tree.depth[c] + 1) :
+                  float(D - tree.depth[c] + 1) + LABEL_BAND
+            y_c < y_p || continue
             push!(segs, Makie.Point2f(x_p, y_p), Makie.Point2f(x_c, y_c))
         end
     end
     return segs
 end
 
-"""Straight-line DAG edge segments for the y-tree (depth runs on negative x,
-axis position on y). Labels live to the left of each node, so edges ending at
-the node's x don't intersect any label."""
+"""DAG edge segments for the y-tree. Same idea — leaf edges end at the leaf
+node's x; the horizontal label stretching leftward from there visually IS
+the final perpendicular segment."""
 function _tree_edges_y(tree::AxisTree, node_pos::Vector{Float64})
     D = tree_depth(tree)
     segs = Makie.Point2f[]
@@ -252,12 +259,14 @@ end
 
 """Create a sibling x-tree `Axis` above `main`, sharing its x-coordinate.
 
-Tree depth runs upward (root at the top, leaves just above the grid). Floating
-nodes' labels sit above their nodes; leaf labels are rotated 45° below the
-leaf node so they replace the main grid's x-tick labels.
+Tree depth runs upward (root at the top, leaves just above the grid). Leaf
+labels are rendered *vertically* (rotated −90°, reading top-to-bottom) so
+they sit cleanly in their narrow column, hanging below the leaf node toward
+the grid. Internal node labels stay horizontal.
 """
 function tree_axis_top!(pos, tree::AxisTree, axis_count::Int, main::Makie.Axis;
-                        title::AbstractString = "")
+                        title::AbstractString = "",
+                        leaf_label_units::Real = 1.0)
     D = tree_depth(tree)
     ax = Makie.Axis(pos;
         title = title,
@@ -277,24 +286,27 @@ function tree_axis_top!(pos, tree::AxisTree, axis_count::Int, main::Makie.Axis;
         y = float(D - tree.depth[k] + 1)
         is_leaf = tree.axis_idx[k] !== nothing
         if is_leaf
-            # Leaf labels act as grid x-tick labels — horizontal, anchored
-            # to top-center so they hang below the leaf node toward the grid.
+            # Vertical label hanging below the leaf node — it visually IS
+            # the final perpendicular segment of the path from parent to
+            # leaf (the diagonal edge ends right at the leaf node y, where
+            # this label begins).
             Makie.text!(ax, node_pos[k], y;
                 text = _shorten(typelabel(T); maxlen = TREE_NAME_MAXLEN),
                 color = _label_color(T, tree.has_method[k]),
-                align = (:center, :top), fontsize = 11,
-                offset = (0.0f0, -4.0f0))
+                align = (:right, :center),
+                rotation = Float32(pi / 2),
+                fontsize = 11, offset = (0.0f0, -2.0f0))
         else
             Makie.text!(ax, node_pos[k], y;
-                text = _shorten(typelabel(T); maxlen = TREE_NAME_MAXLEN),
+                text = _shorten(typelabel(T); maxlen = TREE_INTERNAL_MAXLEN),
                 color = _label_color(T, tree.has_method[k]),
                 align = (:center, :bottom), fontsize = 11,
                 offset = (0.0f0, 4.0f0))
         end
     end
-    # Extend ylims downward so the rotated leaf labels (which hang below the
-    # leaf nodes at y=1) fit inside the axis viewport without clipping.
-    Makie.ylims!(ax, -0.6, D + 1.8)
+    # Extend ylims below leaf nodes by `leaf_label_units` data units so the
+    # vertical labels fit inside the viewport.
+    Makie.ylims!(ax, 1.0 - leaf_label_units, D + 1.8)
     return ax
 end
 
@@ -317,20 +329,21 @@ function tree_axis_left!(pos, tree::AxisTree, axis_count::Int, main::Makie.Axis)
     segs = _tree_edges_y(tree, node_pos)
     isempty(segs) ||
         Makie.linesegments!(ax, segs; color = TREE_COLOR, linewidth = TREE_LINEWIDTH)
+    very_dense = axis_count > 18
+    leaf_font = very_dense ? 9 : 11
+    leaf_maxlen = axis_count > 8 ? (very_dense ? 14 : 18) : TREE_NAME_MAXLEN
     for k in 1:length(tree.nodes)
         T = tree.nodes[k]
         T isa Type || continue
         x = -float(D - tree.depth[k] + 1)
         is_leaf = tree.axis_idx[k] !== nothing
-        # Leaves act as grid y-tick labels (centered on the row); floating
-        # nodes still sit slightly above their edge so the diagonal connector
-        # doesn't run through the label baseline.
         align = is_leaf ? (:right, :center) : (:right, :bottom)
-        offset = is_leaf ? (-4.0f0, 0.0f0) : (-4.0f0, 3.0f0)
+        offset = is_leaf ? (-2.0f0, 0.0f0) : (-4.0f0, 3.0f0)
+        maxlen = is_leaf ? leaf_maxlen : TREE_INTERNAL_MAXLEN
         Makie.text!(ax, x, node_pos[k];
-            text = _shorten(typelabel(T); maxlen = TREE_NAME_MAXLEN),
+            text = _shorten(typelabel(T); maxlen = maxlen),
             color = _label_color(T, tree.has_method[k]),
-            align = align, fontsize = 11, offset = offset)
+            align = align, fontsize = leaf_font, offset = offset)
     end
     # Left pad enough for the widest *root-level* label (those extend furthest
     # left). Char-to-data-unit is a heuristic; the figure colsize compensates.
@@ -367,6 +380,42 @@ function lod_ticks!(ax, n1, n2 = nothing)
         ax.xticks = _visible_ticks(o[1], o[1] + w[1], n1)
         n2 === nothing || (ax.yticks = _visible_ticks(o[2], o[2] + w[2], n2))
     end
+end
+
+"""
+    _highlight_outline(grid, h, nx, ny) -> Vector{Point2f}
+
+Outer-boundary edge segments for cells in `grid` whose value equals `h` —
+only edges that face a non-matching neighbour are drawn, so the union of
+matching cells gets a single outline (any number of disjoint components,
+each with its own outer ring). Returns an empty vector when `h <= 0`
+(no method to highlight).
+"""
+function _highlight_outline(grid, h::Integer, nx::Int, ny::Int)
+    segs = Makie.Point2f[]
+    h <= 0 && return segs
+    matches(i, j) = 1 <= i <= nx && 1 <= j <= ny &&
+                    (ndims(grid) == 1 ? grid[i] == h : grid[i, j] == h)
+    for i in 1:nx, j in 1:ny
+        matches(i, j) || continue
+        # top edge — bordering (i, j+1)
+        matches(i, j + 1) ||
+            push!(segs, Makie.Point2f(i - 0.5, j + 0.5),
+                         Makie.Point2f(i + 0.5, j + 0.5))
+        # bottom edge — bordering (i, j-1)
+        matches(i, j - 1) ||
+            push!(segs, Makie.Point2f(i - 0.5, j - 0.5),
+                         Makie.Point2f(i + 0.5, j - 0.5))
+        # left edge — bordering (i-1, j)
+        matches(i - 1, j) ||
+            push!(segs, Makie.Point2f(i - 0.5, j - 0.5),
+                         Makie.Point2f(i - 0.5, j + 0.5))
+        # right edge — bordering (i+1, j)
+        matches(i + 1, j) ||
+            push!(segs, Makie.Point2f(i + 0.5, j - 0.5),
+                         Makie.Point2f(i + 0.5, j + 0.5))
+    end
+    return segs
 end
 
 """Thin cell separators, confined to the grid (not spanning into the margins)."""
@@ -408,21 +457,14 @@ function plot_1d!(pos, model, hovered, info, infocolor;
     end
     Makie.image!(ax, (0.5, n + 0.5), (0.5, 1.5), cols; interpolate = false)
     cell_borders!(ax, n, 1)
-    # Highlight overlay: cells whose grid value matches `hovered` get a bright
-    # outline. Both cell-hover and legend-hover drive `hovered`, giving
-    # bidirectional same-method highlighting.
-    highlight_rects = Makie.lift(hovered) do h
-        h <= 0 && return Makie.Rect2f[]
-        out = Makie.Rect2f[]
-        for i in 1:n
-            model.grid[i] == h && push!(out, Makie.Rect2f(i - 0.5, 0.5, 1.0, 1.0))
-        end
-        out
+    # Highlight: outer boundary of cells matching `hovered` (only the edges
+    # that border a non-matching cell are drawn, giving a single outline
+    # around the whole region rather than per-cell boxes).
+    hl_segs_1d = Makie.lift(hovered) do h
+        _highlight_outline(model.grid, h, n, 1)
     end
-    Makie.poly!(ax, highlight_rects;
-        color = Makie.RGBAf(0, 0, 0, 0), strokecolor = (:white, 0.95), strokewidth = 3)
-    Makie.poly!(ax, highlight_rects;
-        color = Makie.RGBAf(0, 0, 0, 0), strokecolor = :black, strokewidth = 1)
+    Makie.linesegments!(ax, hl_segs_1d; color = (:white, 0.95), linewidth = 4)
+    Makie.linesegments!(ax, hl_segs_1d; color = :black, linewidth = 1.5)
     Makie.limits!(ax, 0.5, n + 0.5, 0.5, 1.5)
     Makie.on(Makie.events(ax.scene).mouseposition) do _
         if Makie.is_mouseinside(ax.scene)
@@ -475,21 +517,14 @@ function plot_2d!(pos, model, hovered, info, infocolor;
     end
     Makie.image!(ax, (0.5, nx + 0.5), (0.5, ny + 0.5), cols; interpolate = false)
     big || cell_borders!(ax, nx, ny)
-    # Bidirectional same-method highlight: cells matching `hovered`'s grid
-    # value get a bright outline (white over black). Driven by both cell
-    # hover (below) and legend hover (in make_legend!).
-    highlight_rects = Makie.lift(hovered) do h
-        h <= 0 && return Makie.Rect2f[]
-        out = Makie.Rect2f[]
-        for i in 1:nx, j in 1:ny
-            model.grid[i, j] == h && push!(out, Makie.Rect2f(i - 0.5, j - 0.5, 1.0, 1.0))
-        end
-        out
+    # Highlight: outer boundary of cells matching `hovered` (only the edges
+    # that border a non-matching cell are drawn). Gives a single outline
+    # around the union of matching cells, even for disjoint regions.
+    hl_segs_2d = Makie.lift(hovered) do h
+        _highlight_outline(model.grid, h, nx, ny)
     end
-    Makie.poly!(ax, highlight_rects;
-        color = Makie.RGBAf(0, 0, 0, 0), strokecolor = (:white, 0.95), strokewidth = 3)
-    Makie.poly!(ax, highlight_rects;
-        color = Makie.RGBAf(0, 0, 0, 0), strokecolor = :black, strokewidth = 1)
+    Makie.linesegments!(ax, hl_segs_2d; color = (:white, 0.95), linewidth = 4)
+    Makie.linesegments!(ax, hl_segs_2d; color = :black, linewidth = 1.5)
     Makie.limits!(ax, 0.5, nx + 0.5, 0.5, ny + 0.5)
     Makie.on(Makie.events(ax.scene).mouseposition) do _
         if Makie.is_mouseinside(ax.scene)

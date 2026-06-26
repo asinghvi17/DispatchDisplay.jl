@@ -134,7 +134,10 @@ function _render!(d::DispatchDisplayResult)
         Makie.rowsize!(fig.layout, 1, Makie.Fixed(title_h))
         title_row_used = true
         nx, ny = length(model.axes[1]), length(model.axes[2])
-        xt_h = showtx ? tree_height(tx) * 56.0 + 40.0 : 0.0
+        # X-tree leaf labels are vertical; reserve pixels for the rotated
+        # text (~10 chars at fontsize 11 ≈ 70 px) below the tree.
+        xt_label_h = 70.0
+        xt_h = showtx ? tree_height(tx) * 56.0 + xt_label_h : 0.0
         yt_w = showty ? tree_height(ty) * 36.0 + 110.0 : 0.0
         # Pixel budget for the grid: figure size minus tree axes and the
         # below-grid stack (hover panel + legend + refresh + paddings). The
