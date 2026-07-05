@@ -126,9 +126,11 @@ function _render!(d::DispatchDisplayResult)
             th = tree_bands(model, 1, cell1; top = true).total
             ax_main = plot_main!(fig[3, 1], model, hovered, info, infocolor;
                                  show_title = false, show_axis_labels = false)
-            ax_tree = tree_axis_top!(fig[2, 1], model, ax_main; cellpx = cell1)
+            tr = tree_axis_top!(fig[2, 1], model, ax_main; cellpx = cell1)
             ax_main.width = n1 * cell1
-            ax_tree.width = n1 * cell1
+            tr.ax.width = n1 * cell1
+            tree_interaction!(ax_main, n1, 1,
+                              [(; ax = tr.ax, hits = tr.hits, cols = true)])
             Makie.rowsize!(fig.layout, 2, Makie.Fixed(th))
             Makie.rowsize!(fig.layout, 3, Makie.Fixed(cell1))
             Makie.rowgap!(fig.layout, 2, 2)
@@ -172,16 +174,20 @@ function _render!(d::DispatchDisplayResult)
         ax_main = plot_main!(fig[main_row, main_col], model, hovered, info, infocolor;
                              show_title = false,
                              show_axis_labels = show_axis_labels)
+        treedims = NamedTuple[]
         if showtx
-            tree_axis_top!(fig[2, main_col], model, ax_main; cellpx = cellpx)
+            trx = tree_axis_top!(fig[2, main_col], model, ax_main; cellpx = cellpx)
+            push!(treedims, (; ax = trx.ax, hits = trx.hits, cols = true))
             Makie.rowsize!(fig.layout, 2, Makie.Fixed(xt_h))
             Makie.rowgap!(fig.layout, 2, 2)
         end
         if showty
-            tree_axis_left!(fig[main_row, 1], model, ax_main; cellpx = cellpx)
+            trl = tree_axis_left!(fig[main_row, 1], model, ax_main; cellpx = cellpx)
+            push!(treedims, (; ax = trl.ax, hits = trl.hits, cols = false))
             Makie.colsize!(fig.layout, 1, Makie.Fixed(yt_w))
             Makie.colgap!(fig.layout, 1, 2)
         end
+        isempty(treedims) || tree_interaction!(ax_main, nx, ny, treedims)
         Makie.colsize!(fig.layout, main_col, Makie.Fixed(cellpx * nx))
         Makie.rowsize!(fig.layout, main_row, Makie.Fixed(cellpx * ny))
         r = main_row + 1
@@ -266,9 +272,11 @@ never filtered):
   cell (the constituents are still expanded onto the axis either way).
 
 Hover a cell to highlight the owning method in the legend (and, when method
-sources are long, show the source). Cells whose axis type is abstract are
-rendered with reduced alpha. Method colours are stable: defining new methods
-never reshuffles existing ones.
+sources are long, show the source). Hover a tree entry (leaf, bracket or
+union rail) to band the grid cells it covers; click to pin the band, and pin
+an entry on each axis to outline their intersection. Cells whose axis type
+is abstract are rendered with reduced alpha. Method colours are stable:
+defining new methods never reshuffles existing ones.
 """
 function dispatchdisplay(f, types...; arity = nothing, size = nothing,
                          show_abstracts::Bool = true, show_any::Bool = true,

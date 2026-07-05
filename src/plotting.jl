@@ -270,12 +270,41 @@ function tree_bands(model::DispatchModel, dim::Int, cellpx::Real; top::Bool)
     return (; t, lanes, brackets, bdepths, leafpx, rot, total)
 end
 
+"""One hoverable tree element: hit-box in tree-axis data coords plus the
+grid cells (axis positions) it covers."""
+struct TreeHit
+    kind::Symbol            # :leaf, :rail or :bracket
+    rect::Makie.Rect2f
+    cells::Vector{Int}
+end
+
+"""Index of the hit whose rect contains `p`, or 0 (hit-boxes never overlap)."""
+function _hit_at(hits::Vector{TreeHit}, p)
+    for (i, h) in enumerate(hits)
+        o, w = h.rect.origin, h.rect.widths
+        o[1] <= p[1] <= o[1] + w[1] && o[2] <= p[2] <= o[2] + w[2] && return i
+    end
+    return 0
+end
+
+"""Contiguous runs in sorted `cells` (rail members may be non-contiguous)."""
+function _cell_runs(cells::Vector{Int})
+    runs = UnitRange{Int}[]
+    isempty(cells) && return runs
+    lo = hi = first(cells)
+    for c in Iterators.drop(cells, 1)
+        c == hi + 1 ? (hi = c) : (push!(runs, lo:hi); lo = hi = c)
+    end
+    push!(runs, lo:hi)
+    return runs
+end
+
 """
-    tree_axis_top!(pos, model, main; cellpx, dim = 1) -> Makie.Axis
+    tree_axis_top!(pos, model, main; cellpx, dim = 1) -> (; ax, hits)
 
 Sibling x-tree `Axis` above `main`: leaf labels against the grid, union
 rails, then nested brackets. `cellpx` (on-screen column width) drives label
-fitting.
+fitting. `hits` are the [`TreeHit`](@ref) boxes for [`tree_interaction!`](@ref).
 """
 function tree_axis_top!(pos, model::DispatchModel, main::Makie.Axis;
                         cellpx::Real, dim::Int = 1)
@@ -288,6 +317,7 @@ function tree_axis_top!(pos, model::DispatchModel, main::Makie.Axis;
         yticksvisible = false, ygridvisible = false)
     Makie.hidespines!(ax)
     Makie.linkxaxes!(main, ax)
+    hits = TreeHit[]
     # leaf labels
     for k in 1:length(t.nodes)
         _is_leafnode(t, k) || continue
@@ -306,6 +336,9 @@ function tree_axis_top!(pos, model::DispatchModel, main::Makie.Axis;
                 text = lbl, align = (:center, :bottom),
                 fontsize = TREE_LEAF_FS, color = color, font = font)
         end
+        push!(hits, TreeHit(:leaf,
+            Makie.Rect2f(t.axis_idx[k] - 0.5, 0.0, 1.0, b.leafpx),
+            [t.axis_idx[k]]))
     end
     # union rails
     for (lane, k) in enumerate(b.lanes)
@@ -323,6 +356,10 @@ function tree_axis_top!(pos, model::DispatchModel, main::Makie.Axis;
             text = _rail_label(members, (last(lp) - first(lp) + 0.6) * cellpx),
             align = (:center, :bottom), fontsize = TREE_RAIL_FS,
             color = col, font = :italic)
+        push!(hits, TreeHit(:rail,
+            Makie.Rect2f(first(lp) - 0.5, b.leafpx + (lane - 1) * TREE_LANE_PX,
+                         last(lp) - first(lp) + 1.0, TREE_LANE_PX),
+            lp))
     end
     # nested brackets
     y0 = b.leafpx + TREE_LANE_PX * length(b.lanes) + (isempty(b.lanes) ? 0.0 : 4.0)
@@ -353,13 +390,17 @@ function tree_axis_top!(pos, model::DispatchModel, main::Makie.Axis;
                 fontsize = TREE_BRACKET_FS, color = color, font = _tree_label_font(T))
         end
         Makie.linesegments!(ax, segs; color = TREE_LINE, linewidth = 1.3)
+        push!(hits, TreeHit(:bracket,
+            Makie.Rect2f(first(lp) - 0.5, y0 + lvl * TREE_LEVEL_PX,
+                         last(lp) - first(lp) + 1.0, TREE_LEVEL_PX),
+            lp))
     end
     Makie.ylims!(ax, 0.0, b.total)
-    return ax
+    return (; ax, hits)
 end
 
 """
-    tree_axis_left!(pos, model, main; cellpx, dim = 2) -> Makie.Axis
+    tree_axis_left!(pos, model, main; cellpx, dim = 2) -> (; ax, hits)
 
 Mirror of [`tree_axis_top!`](@ref) left of `main`: negative x (root
 leftmost), rail and bracket labels rotated 90°. `cellpx` is the on-screen
@@ -377,6 +418,7 @@ function tree_axis_left!(pos, model::DispatchModel, main::Makie.Axis;
     Makie.hidespines!(ax)
     Makie.linkyaxes!(main, ax)
     Makie.xlims!(ax, -b.total, 0.0)
+    hits = TreeHit[]
     for k in 1:length(t.nodes)
         _is_leafnode(t, k) || continue
         T = t.nodes[k]
@@ -386,6 +428,9 @@ function tree_axis_left!(pos, model::DispatchModel, main::Makie.Axis;
             align = (:right, :center), fontsize = TREE_LEAF_FS,
             color = _tree_label_color(T, t.has_method[k]),
             font = _tree_label_font(T))
+        push!(hits, TreeHit(:leaf,
+            Makie.Rect2f(-b.leafpx, t.axis_idx[k] - 0.5, b.leafpx, 1.0),
+            [t.axis_idx[k]]))
     end
     for (lane, k) in enumerate(b.lanes)
         T = t.nodes[k]
@@ -402,6 +447,10 @@ function tree_axis_left!(pos, model::DispatchModel, main::Makie.Axis;
             text = _rail_label(members, (last(lp) - first(lp) + 0.6) * cellpx),
             align = (:center, :bottom), rotation = Float32(pi / 2),
             fontsize = TREE_RAIL_FS, color = col, font = :italic)
+        push!(hits, TreeHit(:rail,
+            Makie.Rect2f(-(b.leafpx + lane * TREE_LANE_PX), first(lp) - 0.5,
+                         TREE_LANE_PX, last(lp) - first(lp) + 1.0),
+            lp))
     end
     x0 = b.leafpx + TREE_LANE_PX * length(b.lanes) + (isempty(b.lanes) ? 0.0 : 4.0)
     for k in b.brackets
@@ -431,8 +480,104 @@ function tree_axis_left!(pos, model::DispatchModel, main::Makie.Axis;
                 color = color, font = _tree_label_font(T))
         end
         Makie.linesegments!(ax, segs; color = TREE_LINE, linewidth = 1.3)
+        push!(hits, TreeHit(:bracket,
+            Makie.Rect2f(-(x0 + (lvl + 1) * TREE_LEVEL_PX), first(lp) - 0.5,
+                         TREE_LEVEL_PX, last(lp) - first(lp) + 1.0),
+            lp))
     end
-    return ax
+    return (; ax, hits)
+end
+
+# --- tree hover / pin interaction ---------------------------------------------
+
+const TREE_ACCENT = Makie.RGBAf(0.25, 0.45, 0.72, 1.0)
+const _OFFSCREEN = Makie.Rect2f(-1.0f6, -1.0f6, 1.0f-3, 1.0f-3)
+
+_with_alpha(c::Makie.RGBAf, a) = Makie.RGBAf(c.r, c.g, c.b, a)
+
+"""Full-height column bands (`cols = true`) or full-width row bands over the
+grid for `cells`, one rect per contiguous run."""
+_band_rects(cells::Vector{Int}, cols::Bool, nx::Int, ny::Int) =
+    isempty(cells) ? [_OFFSCREEN] :
+    [cols ? Makie.Rect2f(first(r) - 0.5, 0.5, length(r), ny) :
+            Makie.Rect2f(0.5, first(r) - 0.5, nx, length(r))
+     for r in _cell_runs(cells)]
+
+"""
+    tree_interaction!(ax_main, nx, ny, dims) -> pins
+
+Hovering a tree element highlights it and bands the grid cells it covers;
+left-click pins the band (click again, or on empty tree space, to clear).
+`dims` holds `(; ax, hits, cols)` per tree axis — `cols` says whether its
+cells index grid columns or rows. One pin per dimension, so pinning on both
+axes of a 2D grid outlines their intersection. Returns the pin
+`Observable`s (indices into `hits`, 0 = none).
+"""
+function tree_interaction!(ax_main::Makie.Axis, nx::Int, ny::Int, dims)
+    colpin = rowpin = nothing
+    pins = Makie.Observable{Int}[]
+    for d in dims
+        ax, hits, cols = d.ax, d.hits, d.cols
+        hov = Makie.Observable(0)
+        pin = Makie.Observable(0)
+        push!(pins, pin)
+        cols ? (colpin = (pin, hits)) : (rowpin = (pin, hits))
+        hov_vis = Makie.lift((h, p) -> h == p ? 0 : h, hov, pin)
+
+        for (obs, fill, stroke) in ((hov_vis, 0.10, 0.0), (pin, 0.18, 0.8))
+            rect = Makie.lift(i -> i == 0 ? _OFFSCREEN : hits[i].rect, obs)
+            backdrop = Makie.poly!(ax, rect;
+                color = _with_alpha(TREE_ACCENT, fill),
+                strokecolor = _with_alpha(TREE_ACCENT, stroke), strokewidth = 1,
+                xautolimits = false, yautolimits = false)
+            Makie.translate!(backdrop, 0, 0, -1)   # behind labels and lines
+            bands = Makie.lift(i -> i == 0 ? [_OFFSCREEN] :
+                               _band_rects(hits[i].cells, cols, nx, ny), obs)
+            # Low-alpha fill keeps method colours legible; the stroke carries
+            # the band's extent.
+            Makie.poly!(ax_main, bands; color = _with_alpha(TREE_ACCENT, fill),
+                strokecolor = _with_alpha(TREE_ACCENT, 0.55 + 0.35 * stroke),
+                strokewidth = 1.2 + 0.5 * stroke,
+                xautolimits = false, yautolimits = false)
+        end
+
+        # Left-click means "pin" on tree axes, not rectangle zoom.
+        try
+            Makie.deregister_interaction!(ax, :rectanglezoom)
+        catch
+        end
+        Makie.on(Makie.events(ax.scene).mouseposition) do _
+            if Makie.is_mouseinside(ax.scene)
+                hov[] = _hit_at(hits, Makie.mouseposition(ax.scene))
+            elseif hov[] != 0
+                hov[] = 0
+            end
+        end
+        Makie.on(Makie.events(ax.scene).mousebutton) do ev
+            (ev.button == Makie.Mouse.left && ev.action == Makie.Mouse.press &&
+             Makie.is_mouseinside(ax.scene)) || return Makie.Consume(false)
+            h = _hit_at(hits, Makie.mouseposition(ax.scene))
+            pin[] = (h == pin[] ? 0 : h)
+            return Makie.Consume(h != 0)
+        end
+    end
+    # Column pin × row pin = area selection; overlapping bands already darken
+    # it, the outline makes it crisp.
+    if colpin !== nothing && rowpin !== nothing
+        inter = Makie.lift(colpin[1], rowpin[1]) do pc, pr
+            (pc == 0 || pr == 0) && return [_OFFSCREEN]
+            [Makie.Rect2f(first(cr) - 0.5, first(rr) - 0.5, length(cr), length(rr))
+             for cr in _cell_runs(colpin[2][pc].cells)
+             for rr in _cell_runs(rowpin[2][pr].cells)]
+        end
+        Makie.poly!(ax_main, inter; color = Makie.RGBAf(0, 0, 0, 0),
+            strokecolor = (:white, 0.95), strokewidth = 3.5,
+            xautolimits = false, yautolimits = false)
+        Makie.poly!(ax_main, inter; color = Makie.RGBAf(0, 0, 0, 0),
+            strokecolor = TREE_ACCENT, strokewidth = 1.6,
+            xautolimits = false, yautolimits = false)
+    end
+    return pins
 end
 
 """Default 1D figure height: the `_render!` stack (title + tree + strip +

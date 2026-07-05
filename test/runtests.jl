@@ -140,6 +140,43 @@ end
     @test b.total > 0
 end
 
+@testset "tree interaction" begin
+    @test DispatchDisplay._cell_runs([1, 2, 3, 5, 7, 8]) == [1:3, 5:5, 7:8]
+    @test DispatchDisplay._cell_runs(Int[]) == UnitRange{Int}[]
+    # Column band per run, spanning all rows; row bands mirror it.
+    r = DispatchDisplay._band_rects([2, 3], true, 4, 5)
+    @test length(r) == 1 && r[1] == Rect2f(1.5, 0.5, 2, 5)
+    r = DispatchDisplay._band_rects([2], false, 4, 5)
+    @test r[1] == Rect2f(0.5, 1.5, 4, 1)
+
+    # Hit-boxes from a rendered tree axis: one per leaf, rail and bracket,
+    # and point lookup lands on the right element.
+    uf2(x::Union{Int,String}, y::Int) = 1
+    uf2(x::Float64, y::Int) = 2
+    m = build_model(uf2, nothing)
+    fig = Figure()
+    ax_main = Axis(fig[2, 1])
+    tr = DispatchDisplay.tree_axis_top!(fig[1, 1], m, ax_main; cellpx = 96.0)
+    t = m.trees[1]
+    nleaf = count(k -> DispatchDisplay._is_leafnode(t, k), 1:length(t.nodes))
+    @test count(h -> h.kind == :leaf, tr.hits) == nleaf
+    @test count(h -> h.kind == :rail, tr.hits) == 1
+    rail = only(h for h in tr.hits if h.kind == :rail)
+    @test rail.cells ==
+          DispatchDisplay._leaf_span(t, findfirst(==(Union{Int,String}), t.nodes);
+                                     include_self = false)
+    hi = DispatchDisplay._hit_at(tr.hits, (rail.cells[1], rail.rect.origin[2] + 1.0))
+    @test tr.hits[hi].kind == :rail
+    @test DispatchDisplay._hit_at(tr.hits, (-100.0, -100.0)) == 0
+
+    # Wiring is a no-throw smoke test; pins drive the lifted band rects.
+    pins = DispatchDisplay.tree_interaction!(ax_main, length(m.axes[1]), 1,
+        [(; ax = tr.ax, hits = tr.hits, cols = true)])
+    @test length(pins) == 1
+    pins[1][] = hi
+    pins[1][] = 0
+end
+
 @testset "stable colours when methods are added" begin
     scol(x::Int) = 1
     order = IdDict{Method,Int}()
