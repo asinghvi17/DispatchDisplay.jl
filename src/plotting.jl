@@ -120,243 +120,334 @@ function legend_rows(model::DispatchModel)
     return rows, v2r, inline
 end
 
-# --- DAG rendering on a linked sibling axis -----------------------------------
+# --- bracket trees on linked sibling axes ------------------------------------
 #
-# Each grid axis-dimension gets its own `tree_axis_*!` Axis that shares its data
-# coordinate with the main grid via `linkxaxes!`/`linkyaxes!`. The DAG is drawn
-# as squared `linesegments!` connectors on this sibling axis, with `text!`
-# labels (gray for abstracts/Unions) at each node. Parent rests at depth
-# `tree_depth - depth[p] + 1`, so shallow parents (close to the root) sit
-# furthest from the grid, hugging the outside.
+# Each grid axis-dimension gets a sibling Axis sharing its data coordinate
+# with the main grid (`linkxaxes!`/`linkyaxes!`). Subtyping renders as nested
+# span brackets; union membership as one dashed rail per Union sig type,
+# dotted at the member columns in the owning method's colour. (A node-link
+# tree crosses edges at multi-parent DAG nodes and needs one edge per union
+# member.) Bands stack grid-outward: leaf labels, rails, then brackets with
+# the most specific level nearest the grid.
 
-const TREE_COLOR = Makie.RGBAf(0.45, 0.45, 0.45, 1.0)
-const TREE_LINEWIDTH = 1.2
-const LABEL_CONCRETE       = Makie.RGBAf(0.10, 0.10, 0.10, 1.0)   # concrete + has method
-const LABEL_NONCONCRETE    = Makie.RGBAf(0.35, 0.35, 0.35, 1.0)   # abstract/Union + has method
-const LABEL_INTERMEDIATE   = Makie.RGBAf(0.55, 0.55, 0.55, 1.0)   # no own method (pure intermediate)
-const TREE_NAME_MAXLEN = 22          # leaf label truncation length
-const TREE_INTERNAL_MAXLEN = 12      # internal-node label truncation length
+const TREE_LINE        = Makie.RGBAf(0.45, 0.45, 0.45, 1.0)
+const TREE_LABEL_DARK  = Makie.RGBAf(0.12, 0.12, 0.12, 1.0)   # concrete + has method
+const TREE_LABEL_MID   = Makie.RGBAf(0.32, 0.32, 0.32, 1.0)   # abstract/Union + has method
+const TREE_LABEL_LIGHT = Makie.RGBAf(0.55, 0.55, 0.55, 1.0)   # no own method (pure intermediate)
+const TREE_LANE_PX  = 24.0     # union-rail lane pitch (px)
+const TREE_LEVEL_PX = 30.0     # bracket level pitch (px)
+const TREE_LEAF_FS    = 12.0
+const TREE_BRACKET_FS = 11.0
+const TREE_RAIL_FS    = 10.5
 
-"""Tree axis depth (the deepest path length), used to size the sibling axis."""
-tree_height(t::AxisTree) = tree_depth(t) + 1
+# Em-normalised per-character advances; one cache serves every font size.
+const _ADVANCE_CACHE = Dict{Char,Float64}()
 
-"""Label colour tier — concrete-with-method darkest, intermediate lightest."""
-function _label_color(@nospecialize(T), has_method::Bool)
-    has_method || return LABEL_INTERMEDIATE
-    is_abstract_axis(T) ? LABEL_NONCONCRETE : LABEL_CONCRETE
-end
-
-"""
-    _tree_node_positions(tree, axis_count) -> Vector{Float64}
-
-Position each tree node along its axis dimension:
-* axis leaves sit at their `axis_idx` (integer).
-* floating nodes sit at the centroid of their *axis-leaf* descendants, with a
-  small offset when the centroid coincides exactly with an axis leaf's
-  position (otherwise the floating node's label would sit on top of the leaf
-  label — common for `Mammal → Dog`-style chains where the floating node has
-  one axis-leaf descendant).
-* Nodes without any axis-leaf descendant fall back to centroid of all
-  descendants, then to the midpoint of the axis.
-"""
-function _tree_node_positions(tree::AxisTree, axis_count::Int)
-    n = length(tree.nodes)
-    pos = fill(NaN, n)
-    for k in 1:n
-        ai = tree.axis_idx[k]
-        ai === nothing || (pos[k] = float(ai))
-    end
-    function leaf_descendants(k)
-        seen = Set{Int}()
-        q = Int[k]
-        while !isempty(q)
-            j = popfirst!(q)
-            for c in tree.children[j]
-                c in seen && continue
-                push!(seen, c)
-                push!(q, c)
+"""Pixel width of `s` at `fontsize` from glyph advances (char-count fallback)."""
+function text_width_px(s::AbstractString, fontsize::Real)
+    w = 0.0
+    for c in s
+        w += get!(_ADVANCE_CACHE, c) do
+            try
+                font = Makie.to_font("TeX Gyre Heros Makie")
+                Float64(Makie.FreeTypeAbstraction.hadvance(
+                    Makie.FreeTypeAbstraction.get_extent(font, c)))
+            catch
+                0.6
             end
         end
-        return seen
     end
-    # Track leaf-axis indices that already have a floating node directly on
-    # them, so chained floating nodes (e.g. Number → Real → Float64) get
-    # progressively larger offsets and stack visibly instead of all colliding.
-    nudge_count = Dict{Int,Int}()
-    for k in 1:n
-        isnan(pos[k]) || continue
-        ds = leaf_descendants(k)
-        leaves = [tree.axis_idx[d] for d in ds if tree.axis_idx[d] !== nothing]
-        if length(leaves) == 1
-            li = leaves[1]
-            offset = 0.35 + 0.18 * get(nudge_count, li, 0)
-            pos[k] = li - offset
-            nudge_count[li] = get(nudge_count, li, 0) + 1
-        elseif !isempty(leaves)
-            pos[k] = sum(leaves) / length(leaves)
-        elseif !isempty(ds)
-            pos[k] = sum(d for d in ds) / length(ds)
-        else
-            pos[k] = (1 + axis_count) / 2
-        end
-    end
-    return pos
+    return w * fontsize
 end
 
-# Reserved data-unit "label band" above each x-tree leaf node: edges stop at
-# the top of this band so they point to the label without slicing through it.
-# Roughly matches the ~14px label height under the per-depth pixel sizing used
-# in `_render!`.
-const LABEL_BAND = 0.35
+_is_leafnode(t::AxisTree, k::Int) = t.axis_idx[k] !== nothing
+_is_unionnode(t::AxisTree, k::Int) = t.nodes[k] isa Type && _is_union(t.nodes[k])
 
-"""DAG edge segments for the x-tree. Internal-to-internal edges are straight
-diagonals. Leaf edges go diagonally from the parent down to the leaf node
-position (where the label starts). The label itself — vertical, hanging
-below the leaf — visually completes the path as its final perpendicular
-segment, so no extra stroke is drawn behind it."""
-function _tree_edges_x(tree::AxisTree, node_pos::Vector{Float64})
-    D = tree_depth(tree)
-    segs = Makie.Point2f[]
-    for p in 1:length(tree.children)
-        ch = tree.children[p]
-        isempty(ch) && continue
-        x_p = node_pos[p]
-        y_p = float(D - tree.depth[p] + 1)
-        for c in ch
-            x_c = node_pos[c]
-            # Endpoint = leaf node y for leaves (label takes over from here),
-            # or a small label-band offset for internal nodes (label sits
-            # above their node so the edge endpoint hits the label top).
-            y_c = tree.axis_idx[c] !== nothing ?
-                  float(D - tree.depth[c] + 1) :
-                  float(D - tree.depth[c] + 1) + LABEL_BAND
-            y_c < y_p || continue
-            push!(segs, Makie.Point2f(x_p, y_p), Makie.Point2f(x_c, y_c))
-        end
-    end
-    return segs
-end
-
-"""DAG edge segments for the y-tree. Same idea — leaf edges end at the leaf
-node's x; the horizontal label stretching leftward from there visually IS
-the final perpendicular segment."""
-function _tree_edges_y(tree::AxisTree, node_pos::Vector{Float64})
-    D = tree_depth(tree)
-    segs = Makie.Point2f[]
-    for p in 1:length(tree.children)
-        ch = tree.children[p]
-        isempty(ch) && continue
-        x_p = -float(D - tree.depth[p] + 1)
-        y_p = node_pos[p]
-        for c in ch
-            x_c = -float(D - tree.depth[c] + 1)
-            y_c = node_pos[c]
-            push!(segs, Makie.Point2f(x_p, y_p), Makie.Point2f(x_c, y_c))
-        end
-    end
-    return segs
-end
-
-"""Create a sibling x-tree `Axis` above `main`, sharing its x-coordinate.
-
-Tree depth runs upward (root at the top, leaves just above the grid). Leaf
-labels are rendered *vertically* (rotated −90°, reading top-to-bottom) so
-they sit cleanly in their narrow column, hanging below the leaf node toward
-the grid. Internal node labels stay horizontal.
 """
-function tree_axis_top!(pos, tree::AxisTree, axis_count::Int, main::Makie.Axis;
-                        title::AbstractString = "",
-                        leaf_label_units::Real = 1.0)
-    D = tree_depth(tree)
+    _leaf_span(tree, k; include_self = true) -> Vector{Int}
+
+Sorted axis positions under tree node `k`: its on-axis leaf descendants, plus
+its own column when it is itself on the axis. Rails pass `include_self=false`
+— a union's rail marks its members, not its own cell.
+"""
+function _leaf_span(t::AxisTree, k::Int; include_self::Bool = true)
+    seen = Set{Int}()
+    q = Int[k]
+    while !isempty(q)
+        j = popfirst!(q)
+        for c in t.children[j]
+            c in seen && continue
+            push!(seen, c)
+            push!(q, c)
+        end
+    end
+    include_self && push!(seen, k)
+    return sort!(Int[t.axis_idx[j] for j in seen if t.axis_idx[j] !== nothing])
+end
+
+"""Colour of the unique method whose signature literally contains `T`;
+grey when zero or several do."""
+function _union_method_color(model::DispatchModel, @nospecialize(T))
+    found = 0
+    col = TREE_LINE
+    for (i, m) in enumerate(model.methodlist)
+        any(a -> a === T, arg_types(m)) || continue
+        found += 1
+        col = model.colors[i]
+    end
+    return found == 1 ? col : TREE_LINE
+end
+
+"""Label colour tier — concrete-with-method darkest, intermediate lightest."""
+_tree_label_color(@nospecialize(T), has_method::Bool) =
+    has_method ? (isconcretetype(T) ? TREE_LABEL_DARK : TREE_LABEL_MID) :
+                 TREE_LABEL_LIGHT
+
+"""Italic for abstracts and Unions."""
+_tree_label_font(@nospecialize(T)) = isconcretetype(T) ? :regular : :italic
+
+"""Leaf label; a Union leaf reads `A ∪ B` rather than `Union{A, …`."""
+_leaf_label(@nospecialize(T)) = _is_union(T) ?
+    join((typelabel(p) for p in expand_union(T)), " ∪ ") : typelabel(T)
+
+"""Largest rail label fitting `span_px`: `A ∪ B ∪ C`, else `A ∪ ⋯ ∪ Z`,
+else `∪ n types`."""
+function _rail_label(member_labels::Vector{String}, span_px::Real)
+    fits(s) = text_width_px(s, TREE_RAIL_FS) <= 0.9 * span_px
+    full = join(member_labels, " ∪ ")
+    fits(full) && return full
+    if length(member_labels) > 1
+        mid = string(member_labels[1], " ∪ ⋯ ∪ ", member_labels[end])
+        fits(mid) && return mid
+    end
+    return "∪ $(length(member_labels)) types"
+end
+
+"""Interior grid boundaries between depth-1 sibling subtrees."""
+function _block_seps(t::AxisTree, n::Int)
+    seps = Float64[]
+    for k in 1:length(t.nodes)
+        t.depth[k] == 1 || continue
+        _is_unionnode(t, k) && continue
+        isempty(t.children[k]) && continue
+        lp = _leaf_span(t, k)
+        isempty(lp) && continue
+        for b in (first(lp) - 0.5, last(lp) + 0.5)
+            0.5 < b < n + 0.5 || continue
+            any(x -> isapprox(x, b), seps) || push!(seps, b)
+        end
+    end
+    return sort!(seps)
+end
+
+"""
+    tree_bands(model, dim, cellpx; top) -> (; t, lanes, brackets, bdepths, leafpx, rot, total)
+
+Band geometry for one axis dimension, in px. `lanes`: union nodes with
+on-axis members, narrowest span first. `brackets`: non-union nodes with
+children; `bdepths` maps bracket depth → level (most specific = level 0,
+nearest the grid — safe as a level key under single inheritance). Top axes
+rotate leaf labels 45° (`rot`) when the widest label exceeds `cellpx`.
+`total` is the band height (top) or width (left).
+"""
+function tree_bands(model::DispatchModel, dim::Int, cellpx::Real; top::Bool)
+    t = model.trees[dim]
+    lanes = [k for k in 1:length(t.nodes)
+             if _is_unionnode(t, k) && !isempty(_leaf_span(t, k; include_self = false))]
+    sort!(lanes; by = k -> (s = _leaf_span(t, k; include_self = false);
+                            last(s) - first(s)))
+    brackets = [k for k in 1:length(t.nodes)
+                if !_is_unionnode(t, k) && !isempty(t.children[k]) &&
+                   !isempty(_leaf_span(t, k))]
+    bdepths = sort!(unique(t.depth[k] for k in brackets); rev = true)
+    maxleaf = maximum((text_width_px(_shorten(_leaf_label(t.nodes[k]); maxlen = 30),
+                                     TREE_LEAF_FS)
+                       for k in 1:length(t.nodes) if _is_leafnode(t, k)); init = 30.0)
+    rot = top && maxleaf > 0.88 * cellpx
+    leafpx = top ? (rot ? 0.74 * maxleaf + 12.0 : 20.0) : maxleaf + 14.0
+    total = leafpx + TREE_LANE_PX * length(lanes) + (isempty(lanes) ? 0.0 : 4.0) +
+            TREE_LEVEL_PX * length(bdepths) + 8.0
+    return (; t, lanes, brackets, bdepths, leafpx, rot, total)
+end
+
+"""
+    tree_axis_top!(pos, model, main; cellpx, dim = 1) -> Makie.Axis
+
+Sibling x-tree `Axis` above `main`: leaf labels against the grid, union
+rails, then nested brackets. `cellpx` (on-screen column width) drives label
+fitting.
+"""
+function tree_axis_top!(pos, model::DispatchModel, main::Makie.Axis;
+                        cellpx::Real, dim::Int = 1)
+    b = tree_bands(model, dim, cellpx; top = true)
+    t = b.t
     ax = Makie.Axis(pos;
-        title = title,
         xticks = (Float64[], String[]), xticklabelsvisible = false,
         xticksvisible = false, xgridvisible = false,
         yticks = (Float64[], String[]), yticklabelsvisible = false,
         yticksvisible = false, ygridvisible = false)
     Makie.hidespines!(ax)
     Makie.linkxaxes!(main, ax)
-    node_pos = _tree_node_positions(tree, axis_count)
-    segs = _tree_edges_x(tree, node_pos)
-    isempty(segs) ||
-        Makie.linesegments!(ax, segs; color = TREE_COLOR, linewidth = TREE_LINEWIDTH)
-    for k in 1:length(tree.nodes)
-        T = tree.nodes[k]
+    # leaf labels
+    for k in 1:length(t.nodes)
+        _is_leafnode(t, k) || continue
+        T = t.nodes[k]
         T isa Type || continue
-        y = float(D - tree.depth[k] + 1)
-        is_leaf = tree.axis_idx[k] !== nothing
-        if is_leaf
-            # Vertical label hanging below the leaf node — it visually IS
-            # the final perpendicular segment of the path from parent to
-            # leaf (the diagonal edge ends right at the leaf node y, where
-            # this label begins).
-            Makie.text!(ax, node_pos[k], y;
-                text = _shorten(typelabel(T); maxlen = TREE_NAME_MAXLEN),
-                color = _label_color(T, tree.has_method[k]),
-                align = (:right, :center),
-                rotation = Float32(pi / 2),
-                fontsize = 11, offset = (0.0f0, -2.0f0))
+        lbl = _shorten(_leaf_label(T); maxlen = 30)
+        color = _tree_label_color(T, t.has_method[k])
+        font = _tree_label_font(T)
+        if b.rot
+            Makie.text!(ax, t.axis_idx[k] - 0.08, 3.0;
+                text = lbl, align = (:left, :bottom),
+                rotation = Float32(pi / 4), fontsize = TREE_LEAF_FS - 1,
+                color = color, font = font)
         else
-            Makie.text!(ax, node_pos[k], y;
-                text = _shorten(typelabel(T); maxlen = TREE_INTERNAL_MAXLEN),
-                color = _label_color(T, tree.has_method[k]),
-                align = (:center, :bottom), fontsize = 11,
-                offset = (0.0f0, 4.0f0))
+            Makie.text!(ax, Float64(t.axis_idx[k]), 3.0;
+                text = lbl, align = (:center, :bottom),
+                fontsize = TREE_LEAF_FS, color = color, font = font)
         end
     end
-    # Extend ylims below leaf nodes by `leaf_label_units` data units so the
-    # vertical labels fit inside the viewport.
-    Makie.ylims!(ax, 1.0 - leaf_label_units, D + 1.8)
+    # union rails
+    for (lane, k) in enumerate(b.lanes)
+        T = t.nodes[k]
+        lp = _leaf_span(t, k; include_self = false)
+        col = _union_method_color(model, T)
+        y = b.leafpx + (lane - 1) * TREE_LANE_PX + 8.0
+        Makie.lines!(ax, [Makie.Point2f(first(lp) - 0.3, y),
+                          Makie.Point2f(last(lp) + 0.3, y)];
+            color = col, linewidth = 1.6, linestyle = :dash)
+        Makie.scatter!(ax, Float64.(lp), fill(y, length(lp));
+            color = col, markersize = 7)
+        members = String[typelabel(model.axes[dim][i]) for i in lp]
+        Makie.text!(ax, (first(lp) + last(lp)) / 2, y + 3.0;
+            text = _rail_label(members, (last(lp) - first(lp) + 0.6) * cellpx),
+            align = (:center, :bottom), fontsize = TREE_RAIL_FS,
+            color = col, font = :italic)
+    end
+    # nested brackets
+    y0 = b.leafpx + TREE_LANE_PX * length(b.lanes) + (isempty(b.lanes) ? 0.0 : 4.0)
+    for k in b.brackets
+        T = t.nodes[k]
+        lvl = findfirst(==(t.depth[k]), b.bdepths) - 1
+        lp = _leaf_span(t, k)
+        lo = first(lp) - 0.40 - 0.05 * lvl      # outer levels reach slightly wider
+        hi = last(lp) + 0.40 + 0.05 * lvl
+        y = y0 + lvl * TREE_LEVEL_PX + 12.0
+        lbl = _shorten(typelabel(T); maxlen = 24)
+        gapw = (text_width_px(lbl, TREE_BRACKET_FS) + 12.0) / cellpx
+        xm = (lo + hi) / 2
+        color = _tree_label_color(T, t.has_method[k])
+        segs = Makie.Point2f[]
+        push!(segs, Makie.Point2f(lo, y), Makie.Point2f(lo, y - 6))  # end ticks toward grid
+        push!(segs, Makie.Point2f(hi, y), Makie.Point2f(hi, y - 6))
+        if gapw < 0.8 * (hi - lo)
+            # label set into a gap in the bracket line
+            push!(segs, Makie.Point2f(lo, y), Makie.Point2f(xm - gapw / 2, y))
+            push!(segs, Makie.Point2f(xm + gapw / 2, y), Makie.Point2f(hi, y))
+            Makie.text!(ax, xm, y; text = lbl, align = (:center, :center),
+                fontsize = TREE_BRACKET_FS, color = color, font = _tree_label_font(T))
+        else
+            # too narrow for an in-line label
+            push!(segs, Makie.Point2f(lo, y), Makie.Point2f(hi, y))
+            Makie.text!(ax, xm, y + 3.0; text = lbl, align = (:center, :bottom),
+                fontsize = TREE_BRACKET_FS, color = color, font = _tree_label_font(T))
+        end
+        Makie.linesegments!(ax, segs; color = TREE_LINE, linewidth = 1.3)
+    end
+    Makie.ylims!(ax, 0.0, b.total)
     return ax
 end
 
-"""Create a sibling y-tree `Axis` to the left of `main`, sharing its y.
-
-Depth uses *negative* x coordinates so the root naturally sits leftmost
-(furthest from the grid) without flipping the axis. Labels are right-aligned
-with a small pixel gap so they don't run into the connector line.
 """
-function tree_axis_left!(pos, tree::AxisTree, axis_count::Int, main::Makie.Axis)
-    D = tree_depth(tree)
+    tree_axis_left!(pos, model, main; cellpx, dim = 2) -> Makie.Axis
+
+Mirror of [`tree_axis_top!`](@ref) left of `main`: negative x (root
+leftmost), rail and bracket labels rotated 90°. `cellpx` is the on-screen
+row height.
+"""
+function tree_axis_left!(pos, model::DispatchModel, main::Makie.Axis;
+                         cellpx::Real, dim::Int = 2)
+    b = tree_bands(model, dim, cellpx; top = false)
+    t = b.t
     ax = Makie.Axis(pos;
-        yticks = (Float64[], String[]), yticklabelsvisible = false,
-        yticksvisible = false, ygridvisible = false,
         xticks = (Float64[], String[]), xticklabelsvisible = false,
-        xticksvisible = false, xgridvisible = false)
+        xticksvisible = false, xgridvisible = false,
+        yticks = (Float64[], String[]), yticklabelsvisible = false,
+        yticksvisible = false, ygridvisible = false)
     Makie.hidespines!(ax)
     Makie.linkyaxes!(main, ax)
-    node_pos = _tree_node_positions(tree, axis_count)
-    segs = _tree_edges_y(tree, node_pos)
-    isempty(segs) ||
-        Makie.linesegments!(ax, segs; color = TREE_COLOR, linewidth = TREE_LINEWIDTH)
-    very_dense = axis_count > 18
-    leaf_font = very_dense ? 9 : 11
-    leaf_maxlen = axis_count > 8 ? (very_dense ? 14 : 18) : TREE_NAME_MAXLEN
-    for k in 1:length(tree.nodes)
-        T = tree.nodes[k]
+    Makie.xlims!(ax, -b.total, 0.0)
+    for k in 1:length(t.nodes)
+        _is_leafnode(t, k) || continue
+        T = t.nodes[k]
         T isa Type || continue
-        x = -float(D - tree.depth[k] + 1)
-        is_leaf = tree.axis_idx[k] !== nothing
-        align = is_leaf ? (:right, :center) : (:right, :bottom)
-        offset = is_leaf ? (-2.0f0, 0.0f0) : (-4.0f0, 3.0f0)
-        maxlen = is_leaf ? leaf_maxlen : TREE_INTERNAL_MAXLEN
-        Makie.text!(ax, x, node_pos[k];
-            text = _shorten(typelabel(T); maxlen = maxlen),
-            color = _label_color(T, tree.has_method[k]),
-            align = align, fontsize = leaf_font, offset = offset)
+        Makie.text!(ax, -6.0, Float64(t.axis_idx[k]);
+            text = _shorten(_leaf_label(T); maxlen = 30),
+            align = (:right, :center), fontsize = TREE_LEAF_FS,
+            color = _tree_label_color(T, t.has_method[k]),
+            font = _tree_label_font(T))
     end
-    # Left pad enough for the widest *root-level* label (those extend furthest
-    # left). Char-to-data-unit is a heuristic; the figure colsize compensates.
-    max_root_chars = 0
-    for k in 1:length(tree.nodes)
-        T = tree.nodes[k]
-        T isa Type || continue
-        tree.depth[k] == 0 || continue
-        max_root_chars = max(max_root_chars,
-            length(_shorten(typelabel(T); maxlen = TREE_NAME_MAXLEN)))
+    for (lane, k) in enumerate(b.lanes)
+        T = t.nodes[k]
+        lp = _leaf_span(t, k; include_self = false)
+        col = _union_method_color(model, T)
+        x = -(b.leafpx + (lane - 1) * TREE_LANE_PX + 8.0)
+        Makie.lines!(ax, [Makie.Point2f(x, first(lp) - 0.3),
+                          Makie.Point2f(x, last(lp) + 0.3)];
+            color = col, linewidth = 1.6, linestyle = :dash)
+        Makie.scatter!(ax, fill(x, length(lp)), Float64.(lp);
+            color = col, markersize = 7)
+        members = String[typelabel(model.axes[dim][i]) for i in lp]
+        Makie.text!(ax, x - 3.0, (first(lp) + last(lp)) / 2;
+            text = _rail_label(members, (last(lp) - first(lp) + 0.6) * cellpx),
+            align = (:center, :bottom), rotation = Float32(pi / 2),
+            fontsize = TREE_RAIL_FS, color = col, font = :italic)
     end
-    Makie.xlims!(ax, -(D + 1 + 0.4 * max_root_chars), -0.3)
+    x0 = b.leafpx + TREE_LANE_PX * length(b.lanes) + (isempty(b.lanes) ? 0.0 : 4.0)
+    for k in b.brackets
+        T = t.nodes[k]
+        lvl = findfirst(==(t.depth[k]), b.bdepths) - 1
+        lp = _leaf_span(t, k)
+        lo = first(lp) - 0.40 - 0.05 * lvl
+        hi = last(lp) + 0.40 + 0.05 * lvl
+        x = -(x0 + lvl * TREE_LEVEL_PX + 12.0)
+        lbl = _shorten(typelabel(T); maxlen = 24)
+        gapw = (text_width_px(lbl, TREE_BRACKET_FS) + 12.0) / cellpx
+        ym = (lo + hi) / 2
+        color = _tree_label_color(T, t.has_method[k])
+        segs = Makie.Point2f[]
+        push!(segs, Makie.Point2f(x, lo), Makie.Point2f(x + 6, lo))  # end ticks toward grid
+        push!(segs, Makie.Point2f(x, hi), Makie.Point2f(x + 6, hi))
+        if gapw < 0.8 * (hi - lo)
+            push!(segs, Makie.Point2f(x, lo), Makie.Point2f(x, ym - gapw / 2))
+            push!(segs, Makie.Point2f(x, ym + gapw / 2), Makie.Point2f(x, hi))
+            Makie.text!(ax, x, ym; text = lbl, align = (:center, :center),
+                rotation = Float32(pi / 2), fontsize = TREE_BRACKET_FS,
+                color = color, font = _tree_label_font(T))
+        else
+            push!(segs, Makie.Point2f(x, lo), Makie.Point2f(x, hi))
+            Makie.text!(ax, x - 3.0, ym; text = lbl, align = (:center, :bottom),
+                rotation = Float32(pi / 2), fontsize = TREE_BRACKET_FS,
+                color = color, font = _tree_label_font(T))
+        end
+        Makie.linesegments!(ax, segs; color = TREE_LINE, linewidth = 1.3)
+    end
     return ax
+end
+
+"""Default 1D figure height: the `_render!` stack (title + tree + strip +
+panel + legend + toggles) at the default 660px width."""
+function default_1d_height(model::DispatchModel)
+    n = length(model.axes[1])
+    cell = clamp((660.0 - 40.0) / n, 16.0, 96.0)
+    tree = any(model.trees[1].expandable) ?
+           tree_bands(model, 1, cell; top = true).total : 0.0
+    rows, _, inline = legend_rows(model)
+    nmeth = length(model.methodlist)
+    panel = (nmeth > 0 && (nmeth > 16 || !inline)) ? 96.0 : 0.0
+    legend = (isempty(rows) || nmeth > 16) ? 0.0 :
+             legend_layout(length(rows))[2] * 24.0 + 30.0
+    return 24.0 + tree + cell + panel + legend + 44.0 + 10.0 * 5 + 28.0
 end
 
 const MAXLABELS = 30   # hide tick labels above this many visible cells (zoom to reveal)
@@ -418,6 +509,22 @@ function _highlight_outline(grid, h::Integer, nx::Int, ny::Int)
     return segs
 end
 
+"""Heavier separators at depth-1 subtree boundaries, echoing the axis
+brackets inside the grid."""
+function block_separators!(ax, model::DispatchModel, nx::Int, ny::Int)
+    segs = Makie.Point2f[]
+    for b in _block_seps(model.trees[1], nx)
+        push!(segs, Makie.Point2f(b, 0.5), Makie.Point2f(b, ny + 0.5))
+    end
+    if model.ndims >= 2
+        for b in _block_seps(model.trees[2], ny)
+            push!(segs, Makie.Point2f(0.5, b), Makie.Point2f(nx + 0.5, b))
+        end
+    end
+    isempty(segs) ||
+        Makie.linesegments!(ax, segs; color = (:white, 0.95), linewidth = 3.5)
+end
+
 """Thin cell separators, confined to the grid (not spanning into the margins)."""
 function cell_borders!(ax, nx, ny)
     segs = Makie.Point2f[]
@@ -457,6 +564,7 @@ function plot_1d!(pos, model, hovered, info, infocolor;
     end
     Makie.image!(ax, (0.5, n + 0.5), (0.5, 1.5), cols; interpolate = false)
     cell_borders!(ax, n, 1)
+    block_separators!(ax, model, n, 1)
     # Highlight: outer boundary of cells matching `hovered` (only the edges
     # that border a non-matching cell are drawn, giving a single outline
     # around the whole region rather than per-cell boxes).
@@ -517,6 +625,7 @@ function plot_2d!(pos, model, hovered, info, infocolor;
     end
     Makie.image!(ax, (0.5, nx + 0.5), (0.5, ny + 0.5), cols; interpolate = false)
     big || cell_borders!(ax, nx, ny)
+    block_separators!(ax, model, nx, ny)
     # Highlight: outer boundary of cells matching `hovered` (only the edges
     # that border a non-matching cell are drawn). Gives a single outline
     # around the union of matching cells, even for disjoint regions.

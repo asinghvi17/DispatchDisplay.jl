@@ -111,11 +111,27 @@ function _render!(d::DispatchDisplayResult)
                 fontsize = 16, font = :bold, halign = :center)
             Makie.rowsize!(fig.layout, 1, Makie.Fixed(24.0))
             title_row_used = true
+            # Fix the strip's cell size so the tree's label fitting sees the
+            # true on-screen cellpx; equal fixed axis widths keep the linked
+            # x-coordinates pixel-aligned.
+            n1 = length(model.axes[1])
+            fw1, fh1 = Tuple(fig.scene.viewport[].widths)
+            below_h1 = (showpanel ? 96.0 : 0.0) +
+                       (showlegend ? legend_layout(length(rows))[2] * 24.0 + 30.0 : 0.0) +
+                       44.0 + 24.0 + 10.0 * 5 + 28.0
+            prov1 = max(16.0, (fw1 - 40.0) / n1)
+            th = tree_bands(model, 1, prov1; top = true).total
+            avail_h1 = max(24.0, fh1 - th - below_h1)
+            cell1 = clamp(min((fw1 - 40.0) / n1, avail_h1), 16.0, 96.0)
+            th = tree_bands(model, 1, cell1; top = true).total
             ax_main = plot_main!(fig[3, 1], model, hovered, info, infocolor;
                                  show_title = false, show_axis_labels = false)
-            tree_axis_top!(fig[2, 1], tree1, length(model.axes[1]), ax_main; title = "")
-            Makie.rowsize!(fig.layout, 2, Makie.Fixed(tree_height(tree1) * 56.0 + 40.0))
-            Makie.rowgap!(fig.layout, 2, 0)
+            ax_tree = tree_axis_top!(fig[2, 1], model, ax_main; cellpx = cell1)
+            ax_main.width = n1 * cell1
+            ax_tree.width = n1 * cell1
+            Makie.rowsize!(fig.layout, 2, Makie.Fixed(th))
+            Makie.rowsize!(fig.layout, 3, Makie.Fixed(cell1))
+            Makie.rowgap!(fig.layout, 2, 2)
             r = 4
         else
             plot_main!(fig[1, 1], model, hovered, info, infocolor;
@@ -134,15 +150,10 @@ function _render!(d::DispatchDisplayResult)
         Makie.rowsize!(fig.layout, 1, Makie.Fixed(title_h))
         title_row_used = true
         nx, ny = length(model.axes[1]), length(model.axes[2])
-        # X-tree leaf labels are vertical; reserve pixels for the rotated
-        # text (~10 chars at fontsize 11 ≈ 70 px) below the tree.
-        xt_label_h = 70.0
-        xt_h = showtx ? tree_height(tx) * 56.0 + xt_label_h : 0.0
-        yt_w = showty ? tree_height(ty) * 36.0 + 110.0 : 0.0
-        # Pixel budget for the grid: figure size minus tree axes and the
-        # below-grid stack (hover panel + legend + refresh + paddings). The
-        # grid is then sized to `cellpx × nx` wide and `cellpx × ny` tall so
-        # `DataAspect` keeps every cell square without leaving whitespace.
+        # Pixel budget for the grid: figure size minus tree bands and the
+        # below-grid stack; `DataAspect` keeps cells square. Bands and cellpx
+        # are mutually dependent (45° label rotation kicks in on narrow
+        # columns), so size in two passes.
         fw, fh = Tuple(fig.scene.viewport[].widths)
         below_h = (showpanel ? 96.0 : 0.0) +
                   (showlegend ? legend_layout(length(rows))[2] * 24.0 + 30.0 : 0.0) +
@@ -150,21 +161,26 @@ function _render!(d::DispatchDisplayResult)
                   title_h +                                 # title row
                   10.0 * 6 +                                # default rowgaps
                   28.0                                      # figure top+bottom padding
+        prov = max(16.0, (fw - 30.0) / nx)
+        xt_h = showtx ? tree_bands(model, 1, prov; top = true).total : 0.0
+        yt_w = showty ? tree_bands(model, 2, prov; top = false).total : 0.0
         avail_w = max(80.0, fw - yt_w - 30.0)
         avail_h = max(80.0, fh - xt_h - below_h)
         cellpx = max(16.0, min(avail_w / nx, avail_h / ny))
+        xt_h = showtx ? tree_bands(model, 1, cellpx; top = true).total : 0.0
+        yt_w = showty ? tree_bands(model, 2, cellpx; top = false).total : 0.0
         ax_main = plot_main!(fig[main_row, main_col], model, hovered, info, infocolor;
                              show_title = false,
                              show_axis_labels = show_axis_labels)
         if showtx
-            tree_axis_top!(fig[2, main_col], tx, nx, ax_main; title = "")
+            tree_axis_top!(fig[2, main_col], model, ax_main; cellpx = cellpx)
             Makie.rowsize!(fig.layout, 2, Makie.Fixed(xt_h))
-            Makie.rowgap!(fig.layout, 2, 0)
+            Makie.rowgap!(fig.layout, 2, 2)
         end
         if showty
-            tree_axis_left!(fig[main_row, 1], ty, ny, ax_main)
+            tree_axis_left!(fig[main_row, 1], model, ax_main; cellpx = cellpx)
             Makie.colsize!(fig.layout, 1, Makie.Fixed(yt_w))
-            Makie.colgap!(fig.layout, 1, 0)
+            Makie.colgap!(fig.layout, 1, 2)
         end
         Makie.colsize!(fig.layout, main_col, Makie.Fixed(cellpx * nx))
         Makie.rowsize!(fig.layout, main_row, Makie.Fixed(cellpx * ny))
@@ -265,7 +281,8 @@ function dispatchdisplay(f, types...; arity = nothing, size = nothing,
                         show_unions = show_unions)
     # A 1D strip needs far less height than a 2D/3D grid.
     fsize = size !== nothing ? size :
-            model.ndims == 1 ? (660, 400) : (660, 880)
+            model.ndims == 1 ? (660, ceil(Int, default_1d_height(model))) :
+            (660, 880)
     fig = Makie.Figure(; size = fsize, figure_padding = 14)
     d = DispatchDisplayResult(f, provided, arity,
                               show_abstracts, show_any, show_unions,

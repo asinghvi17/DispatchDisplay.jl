@@ -101,6 +101,45 @@ end
     @test m.trees[1].axis_idx[realt] === nothing
 end
 
+@testset "bracket tree geometry" begin
+    m = build_model(foo, Vector{Any}[[Int, Float64, String], [Int, Float64, String]])
+    t = m.trees[1]
+    realt = findfirst(==(Real), t.nodes)
+    # Real spans the two contiguous numeric columns (axis order is
+    # [String, Float64, Int] under the chain-key sort).
+    sp = DispatchDisplay._leaf_span(t, realt)
+    @test length(sp) == 2 && sp == collect(minimum(sp):maximum(sp))
+    # One heavier block separator where the numeric block starts.
+    @test DispatchDisplay._block_seps(t, 3) == [1.5]
+
+    # A union's rail spans its member columns and carries the method's colour.
+    uf(x::Union{Int,String}) = 1
+    uf(x::Float64) = 2
+    mu = build_model(uf, nothing)
+    tu = mu.trees[1]
+    ui = findfirst(==(Union{Int,String}), tu.nodes)
+    @test DispatchDisplay._is_unionnode(tu, ui)
+    @test length(DispatchDisplay._leaf_span(tu, ui; include_self = false)) == 2
+    mi = findfirst(mm -> any(a -> a === Union{Int,String}, arg_types(mm)),
+                   mu.methodlist)
+    @test DispatchDisplay._union_method_color(mu, Union{Int,String}) == mu.colors[mi]
+
+    # Rail labels compact in tiers as the available span shrinks.
+    labs = ["Int8", "Int16", "Int32", "Int64", "Int128"]
+    @test DispatchDisplay._rail_label(labs, 10_000.0) ==
+          "Int8 ∪ Int16 ∪ Int32 ∪ Int64 ∪ Int128"
+    @test DispatchDisplay._rail_label(labs, 130.0) == "Int8 ∪ ⋯ ∪ Int128"
+    @test DispatchDisplay._rail_label(labs, 10.0) == "∪ 5 types"
+
+    @test 25 < DispatchDisplay.text_width_px("Mammal", 11) < 60
+
+    # foo's x tree: no unions, two bracket levels (Real inside Number).
+    b = DispatchDisplay.tree_bands(m, 1, 96.0; top = true)
+    @test isempty(b.lanes)
+    @test length(b.bdepths) == 2
+    @test b.total > 0
+end
+
 @testset "stable colours when methods are added" begin
     scol(x::Int) = 1
     order = IdDict{Method,Int}()
