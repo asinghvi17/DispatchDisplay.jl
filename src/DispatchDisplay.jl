@@ -275,10 +275,12 @@ never filtered):
 
 Hover a cell to highlight the owning method in the legend (and, when method
 sources are long, show the source). Hover a tree entry (leaf, bracket or
-union rail) to band the grid cells it covers; click to pin the band, and pin
-an entry on each axis to outline their intersection. Cells whose axis type
-is abstract are rendered with reduced alpha. Method colours are stable:
-defining new methods never reshuffles existing ones.
+union rail) to dim every grid cell it does not cover; click to pin the
+selection. Dimming stacks across axes, so pinning an entry on each axis of a
+2D grid leaves their (outlined) intersection as the only fully bright
+region. Cells whose axis type is abstract are rendered with reduced alpha.
+Method colours are stable: defining new methods never reshuffles existing
+ones.
 """
 function dispatchdisplay(f, types...; arity = nothing, size = nothing,
                          show_abstracts::Bool = true, show_any::Bool = true,

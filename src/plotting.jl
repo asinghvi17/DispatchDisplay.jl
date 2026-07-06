@@ -495,23 +495,32 @@ const _OFFSCREEN = Makie.Rect2f(-1.0f6, -1.0f6, 1.0f-3, 1.0f-3)
 
 _with_alpha(c::Makie.RGBAf, a) = Makie.RGBAf(c.r, c.g, c.b, a)
 
-"""Full-height column bands (`cols = true`) or full-width row bands over the
-grid for `cells`, one rect per contiguous run."""
-_band_rects(cells::Vector{Int}, cols::Bool, nx::Int, ny::Int) =
-    isempty(cells) ? [_OFFSCREEN] :
-    [cols ? Makie.Rect2f(first(r) - 0.5, 0.5, length(r), ny) :
-            Makie.Rect2f(0.5, first(r) - 0.5, nx, length(r))
-     for r in _cell_runs(cells)]
+const TREE_VEIL_HOVER = 0.30   # dim alpha while hovering
+const TREE_VEIL_PIN   = 0.45   # dim alpha for a pinned selection
+
+"""Rects veiling the grid columns (`cols = true`) or rows NOT in `cells` —
+a selection reads as everything else dimming, and veils from several active
+selections stack, so a column pin × row pin leaves only the intersection at
+full strength."""
+function _veil_rects(cells::Vector{Int}, cols::Bool, nx::Int, ny::Int)
+    n = cols ? nx : ny
+    other = [i for i in 1:n if !(i in cells)]
+    isempty(other) && return [_OFFSCREEN]
+    return [cols ? Makie.Rect2f(first(r) - 0.5, 0.5, length(r), ny) :
+                   Makie.Rect2f(0.5, first(r) - 0.5, nx, length(r))
+            for r in _cell_runs(other)]
+end
 
 """
     tree_interaction!(ax_main, nx, ny, dims) -> pins
 
-Hovering a tree element highlights it and bands the grid cells it covers;
-left-click pins the band (click again, or on empty tree space, to clear).
-`dims` holds `(; ax, hits, cols)` per tree axis — `cols` says whether its
-cells index grid columns or rows. One pin per dimension, so pinning on both
-axes of a 2D grid outlines their intersection. Returns the pin
-`Observable`s (indices into `hits`, 0 = none).
+Hovering a tree element highlights it and dims the grid cells it does *not*
+cover; left-click pins the selection (click again, or on empty tree space,
+to clear). `dims` holds `(; ax, hits, cols)` per tree axis — `cols` says
+whether its cells index grid columns or rows. Veils stack across active
+selections, so pinning on both axes of a 2D grid leaves only the (outlined)
+intersection at full strength. Returns the pin `Observable`s (indices into
+`hits`, 0 = none).
 """
 function tree_interaction!(ax_main::Makie.Axis, nx::Int, ny::Int, dims)
     colpin = rowpin = nothing
@@ -524,20 +533,17 @@ function tree_interaction!(ax_main::Makie.Axis, nx::Int, ny::Int, dims)
         cols ? (colpin = (pin, hits)) : (rowpin = (pin, hits))
         hov_vis = Makie.lift((h, p) -> h == p ? 0 : h, hov, pin)
 
-        for (obs, fill, stroke) in ((hov_vis, 0.10, 0.0), (pin, 0.18, 0.8))
+        for (obs, fill, stroke, veil) in ((hov_vis, 0.10, 0.0, TREE_VEIL_HOVER),
+                                          (pin, 0.18, 0.8, TREE_VEIL_PIN))
             rect = Makie.lift(i -> i == 0 ? _OFFSCREEN : hits[i].rect, obs)
             backdrop = Makie.poly!(ax, rect;
                 color = _with_alpha(TREE_ACCENT, fill),
                 strokecolor = _with_alpha(TREE_ACCENT, stroke), strokewidth = 1,
                 xautolimits = false, yautolimits = false)
             Makie.translate!(backdrop, 0, 0, -1)   # behind labels and lines
-            bands = Makie.lift(i -> i == 0 ? [_OFFSCREEN] :
-                               _band_rects(hits[i].cells, cols, nx, ny), obs)
-            # Low-alpha fill keeps method colours legible; the stroke carries
-            # the band's extent.
-            Makie.poly!(ax_main, bands; color = _with_alpha(TREE_ACCENT, fill),
-                strokecolor = _with_alpha(TREE_ACCENT, 0.55 + 0.35 * stroke),
-                strokewidth = 1.2 + 0.5 * stroke,
+            veils = Makie.lift(i -> i == 0 ? [_OFFSCREEN] :
+                               _veil_rects(hits[i].cells, cols, nx, ny), obs)
+            Makie.poly!(ax_main, veils; color = Makie.RGBAf(1, 1, 1, veil),
                 xautolimits = false, yautolimits = false)
         end
 
@@ -561,8 +567,8 @@ function tree_interaction!(ax_main::Makie.Axis, nx::Int, ny::Int, dims)
             return Makie.Consume(h != 0)
         end
     end
-    # Column pin × row pin = area selection; overlapping bands already darken
-    # it, the outline makes it crisp.
+    # Column pin × row pin = area selection: stacked veils already isolate
+    # the intersection, the outline makes it crisp.
     if colpin !== nothing && rowpin !== nothing
         inter = Makie.lift(colpin[1], rowpin[1]) do pc, pr
             (pc == 0 || pr == 0) && return [_OFFSCREEN]
@@ -570,9 +576,6 @@ function tree_interaction!(ax_main::Makie.Axis, nx::Int, ny::Int, dims)
              for cr in _cell_runs(colpin[2][pc].cells)
              for rr in _cell_runs(rowpin[2][pr].cells)]
         end
-        Makie.poly!(ax_main, inter; color = Makie.RGBAf(0, 0, 0, 0),
-            strokecolor = (:white, 0.95), strokewidth = 3.5,
-            xautolimits = false, yautolimits = false)
         Makie.poly!(ax_main, inter; color = Makie.RGBAf(0, 0, 0, 0),
             strokecolor = TREE_ACCENT, strokewidth = 1.6,
             xautolimits = false, yautolimits = false)

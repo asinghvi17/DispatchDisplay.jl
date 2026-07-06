@@ -143,11 +143,15 @@ end
 @testset "tree interaction" begin
     @test DispatchDisplay._cell_runs([1, 2, 3, 5, 7, 8]) == [1:3, 5:5, 7:8]
     @test DispatchDisplay._cell_runs(Int[]) == UnitRange{Int}[]
-    # Column band per run, spanning all rows; row bands mirror it.
-    r = DispatchDisplay._band_rects([2, 3], true, 4, 5)
-    @test length(r) == 1 && r[1] == Rect2f(1.5, 0.5, 2, 5)
-    r = DispatchDisplay._band_rects([2], false, 4, 5)
-    @test r[1] == Rect2f(0.5, 1.5, 4, 1)
+    # Veils cover the complement: selecting columns 2:3 of a 4x5 grid dims
+    # column 1 and column 4, each as a full-height rect.
+    r = DispatchDisplay._veil_rects([2, 3], true, 4, 5)
+    @test r == [Rect2f(0.5, 0.5, 1, 5), Rect2f(3.5, 0.5, 1, 5)]
+    r = DispatchDisplay._veil_rects([2], false, 4, 5)
+    @test r == [Rect2f(0.5, 0.5, 4, 1), Rect2f(0.5, 2.5, 4, 3)]
+    # Selecting everything dims nothing.
+    @test DispatchDisplay._veil_rects([1, 2, 3, 4], true, 4, 5) ==
+          [DispatchDisplay._OFFSCREEN]
 
     # Hit-boxes from a rendered tree axis: one per leaf, rail and bracket,
     # and point lookup lands on the right element.
