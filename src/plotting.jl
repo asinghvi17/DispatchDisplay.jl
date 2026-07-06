@@ -495,8 +495,11 @@ const _OFFSCREEN = Makie.Rect2f(-1.0f6, -1.0f6, 1.0f-3, 1.0f-3)
 
 _with_alpha(c::Makie.RGBAf, a) = Makie.RGBAf(c.r, c.g, c.b, a)
 
-const TREE_VEIL_HOVER = 0.30   # dim alpha while hovering
-const TREE_VEIL_PIN   = 0.45   # dim alpha for a pinned selection
+const TREE_VEIL_HOVER = 0.40   # dim alpha while hovering
+const TREE_VEIL_PIN   = 0.55   # dim alpha for a pinned selection
+# Light grey, not white: veiled cells read as greyed-out, so the selection
+# pops instead of the rest merely paling toward the background.
+const TREE_VEIL_COLOR = Makie.RGBAf(0.75, 0.76, 0.78, 1.0)
 
 """Rects veiling the grid columns (`cols = true`) or rows NOT in `cells` —
 a selection reads as everything else dimming, and veils from several active
@@ -543,7 +546,7 @@ function tree_interaction!(ax_main::Makie.Axis, nx::Int, ny::Int, dims)
             Makie.translate!(backdrop, 0, 0, -1)   # behind labels and lines
             veils = Makie.lift(i -> i == 0 ? [_OFFSCREEN] :
                                _veil_rects(hits[i].cells, cols, nx, ny), obs)
-            Makie.poly!(ax_main, veils; color = Makie.RGBAf(1, 1, 1, veil),
+            Makie.poly!(ax_main, veils; color = _with_alpha(TREE_VEIL_COLOR, veil),
                 xautolimits = false, yautolimits = false)
         end
 
