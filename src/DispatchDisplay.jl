@@ -216,7 +216,9 @@ function _render!(d::DispatchDisplayResult)
     # Toggle row: small switches to hide/show trees, legend, hover panel —
     # plus the Refresh button. Toggling re-renders without rebuilding the
     # model; Refresh re-queries methods(f) (use it after defining new methods).
-    ctrl = Makie.GridLayout(fig[r, span]; tellheight = false)
+    # tellwidth=false: otherwise this row's natural width shrinks column 1,
+    # squeezing anything (e.g. the 3D axis) whose column isn't Fixed.
+    ctrl = Makie.GridLayout(fig[r, span]; tellheight = false, tellwidth = false)
     trees_t  = Makie.Toggle(ctrl[1, 1]; active = d.show_trees_ui,  width = 28)
     Makie.Label(ctrl[1, 2], "trees"; halign = :left)
     legend_t = Makie.Toggle(ctrl[1, 3]; active = d.show_legend_ui, width = 28)

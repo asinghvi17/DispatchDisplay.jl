@@ -826,17 +826,13 @@ function plot_3d!(pos, model, hovered, info, infocolor)
         xlabel = "arg₁", ylabel = "arg₂", zlabel = "arg₃",
         xticks = (pitch .* (1:nx), namesX), yticks = (1:ny, namesY),
         zticks = (1:nz, namesZ), aspect = :data,
-        # `:fitzoom` (Axis3's default) lets scroll move the camera inside the
-        # data box, which makes the axis frame appear to cut through the cubes.
-        # `:fit` keeps the data framed at all times; rotation still works and
-        # hovering is the primary drill-in interaction anyway.
-        viewmode = :fit,
-        # Give tick labels room to live outside the box.
-        protrusions = 60)
-    # Pad the limits so the outermost cubes don't sit flush against the axis
-    # frame (the cube extends ±thick/2 in x and ±0.5 in y/z from each centre).
+        # `:fitzoom` (the default) fills the cell at the rest view; `:fit`
+        # would fit the bounding sphere and waste ~half the axis area.
+        viewmode = :fitzoom)
+    # Pad the limits just past the cube faces (±thick/2 in x, ±0.5 in y/z
+    # from each centre) so the outer cubes don't clip through the frame.
     Makie.limits!(ax,
-        (0.5 * pitch, (nx + 0.5) * pitch),
+        (pitch - thick / 2 - 0.2, nx * pitch + thick / 2 + 0.2),
         (0.3, ny + 0.7),
         (0.3, nz + 0.7))
     if !isempty(pts)
